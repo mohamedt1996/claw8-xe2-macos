@@ -6,8 +6,9 @@ Each milestone lists the Linux `drivers/gpu/drm/xe` sources to port and a pass c
 |---|---|---|---|---|
 | M0 | macOS boots on the Claw (GOP framebuffer, no accel) | — | Desktop reachable, `ioreg` shows GPU `8086:64a0` | docs only (`docs/OPENCORE.md`) |
 | M1 | Probe: map BAR0, read GMD_ID, forcewake, Xe-core fuses | `xe_pci.c` (`read_gmdid`), `xe_force_wake.c`, `xe_gt_topology.c` | `xe2-graphics-ip = 2004`, `xe2-xe-cores-geometry = 8` | code done, untested |
-| M2 | Stolen memory + GGTT: DSM layout, GGTT PTE read/write, scanout decode | `xe_ttm_stolen_mgr.c`, `xe_ggtt.c`, `xe_wopcm.c`, `xe_pat.c`, `regs/xe_gtt_defs.h` | `xe2-ggtt-decode = ok`; `clawxe2fb=1` draws a checkerboard top-left; `xe2-ggtt-selftest = pte-readback-ok` | **code done, untested** |
-| M3 | Firmware: GuC, HuC, GSC load and auth | `xe_uc_fw.c`, `xe_guc.c`, `xe_guc_ads.c`, `xe_guc_ct.c`, `xe_huc.c`, `xe_gsc.c`; firmware `xe/lnl_guc_70.bin`, `xe/lnl_huc.bin`, `xe/lnl_gsc_104.bin` | GuC reports `READY`, CT channel round-trip | not started |
+| M2 | Stolen memory + GGTT: DSM layout, GGTT PTE read/write, scanout decode | `xe_ttm_stolen_mgr.c`, `xe_ggtt.c`, `xe_wopcm.c`, `xe_pat.c`, `regs/xe_gtt_defs.h` | `xe2-ggtt-decode = ok`; `clawxe2fb=1` draws a checkerboard top-left; `xe2-ggtt-selftest = pte-readback-ok` | code done, untested |
+| M3 | GuC firmware: PAT, WOPCM, reset, minimal ADS, DMA upload, hwconfig, CT enable | `xe_pat.c`, `xe_wopcm.c`, `xe_uc_fw.c`, `xe_guc.c`, `xe_guc_ads.c`, `xe_guc_hwconfig.c`, `xe_guc_ct.c`; firmware `xe/lnl_guc_70.bin` | `xe2-guc = running`, `xe2-guc-hwconfig-status = ok`, `xe2-guc-ct = enabled` | **code done, untested** |
+| M3b | HuC + GSC (media auth, PXP) — not needed for 3D | `xe_huc.c`, `xe_gsc.c`; `xe/lnl_huc.bin`, `xe/lnl_gsc_104.bin` | HuC authenticated | deferred |
 | M4 | Memory + submission: PPGTT (4-level), BOs, exec queues via GuC | `xe_vm.c`, `xe_pt.c`, `xe_bo.c`, `xe_exec_queue.c`, `xe_guc_submit.c`, `xe_lrc.c`, `xe_hw_engine.c` | `MI_STORE_DWORD` batch on RCS writes expected value | not started |
 | M5 | Compute: run a SPIR-V/OpenCL kernel (IGC Xe2 binary) | `xe_exec.c`; Intel IGC (Xe2 target) | Vector-add on 64 Ki elements matches CPU | not started |
 | M6 | Display: Xe2LPD eDP panel, DMC, modeset, IOFramebuffer | `drivers/gpu/drm/xe/display` + shared i915 display code; `i915/xe2lpd_dmc.bin` | Native-resolution framebuffer, backlight control | not started |
@@ -19,6 +20,15 @@ Each milestone lists the Linux `drivers/gpu/drm/xe` sources to port and a pass c
 - Xe2 iGPU has no CPU aperture through GGTT (`xe_ttm_stolen_cpu_access_needs_ggtt()` is false for ≥ 12.70); stolen memory is reached directly through BAR2 + 8 MiB. So the M2 proof is: firmware scanout address → GGTT PTE → CPU address, then drawing pixels at that address.
 - GGTT write self-test only proves the CPU→GSM path. GPU-side use of a new mapping needs GGTT TLB invalidation, which on Xe2 goes through the GuC (`PVC_GUC_TLB_INV_DESC0/1`) → M3.
 - Workarounds applied: Wa_22019338487 (dummy media `GMD_ID` write every 63 GGTT writes), Wa_14019821291 (GSC PSMI carve-out at top of DSM).
+
+## M3 notes
+
+- GuC binary comes from linux-firmware (`xe/lnl_guc_70.bin`, Intel redistributable licence `LICENSE.xe`). CI downloads it, validates the CSS header with `tools/check-guc-fw.py`, and embeds it in the kext; the licence ships in `Contents/Resources`.
+- Load order follows `xe_guc_min_load_for_hwconfig()`: Xe2 PAT table → WOPCM partition (locks until reboot) → GuC reset (Wa_14025883347) → minimal ADS → params in `SOFT_SCRATCH` → shim/PM setup → RSA → DMA header+ucode from GGTT into WOPCM @8K → poll `GUC_STATUS` for `0xF0`.
+- `GET_HWCONFIG` is the end-to-end proof for M2: the GuC writes the hwconfig KLV table into kernel memory through our GGTT mapping (buffer is poisoned first).
+- All GuC-visible buffers are allocated and mapped **before** the GuC starts, so no GGTT TLB invalidation is needed yet. Post-load GGTT updates need the GuC TLB-invalidation action over CT — part of M4.
+- `stop()` disables CT and resets the GuC before freeing any memory it can reach.
+- HuC/GSC are skipped: WOPCM is partitioned with no HuC region, so enabling HuC later requires changing the partition (needs a reboot to unlock).
 
 ## Shortcut worth evaluating
 

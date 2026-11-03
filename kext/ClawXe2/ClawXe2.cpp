@@ -10,6 +10,7 @@
 //             -clawxe2nom2  skip milestone 2 (stolen/GGTT/scanout)
 //             clawxe2fb=1   M2: draw test pattern into GOP framebuffer via GGTT
 //             clawxe2ggtt=1 M2: GGTT PTE write/read-back self-test
+//             clawxe2guc=1  M3: load GuC firmware, read hwconfig, enable CT
 //
 // SPDX-License-Identifier: GPL-2.0-only  (logic derived from Linux drivers/gpu/drm/xe)
 
@@ -70,7 +71,7 @@ bool ClawXe2::start(IOService *provider) {
     setNumber("xe2-device-id", did, 16);
     setNumber("xe2-pci-revision", rev, 8);
     setProperty("xe2-milestone", "M1-probe");
-    setProperty("xe2-driver-version", "0.2.0");
+    setProperty("xe2-driver-version", "0.3.0");
 
     if (!mapBar0()) {
         setProperty("xe2-status", "bar0-map-failed");
@@ -78,8 +79,10 @@ bool ClawXe2::start(IOService *provider) {
     }
 
     readIpVersions();
-    if (graphicsIp_ == xe2::kGraphicsXe2Lpg && !hasBootFlag("-clawxe2nom2"))
+    if (graphicsIp_ == xe2::kGraphicsXe2Lpg && !hasBootFlag("-clawxe2nom2")) {
         m2Run();
+        m3Run();
+    }
 
     uint32_t fwArg = 0;
     if (PE_parse_boot_argn("clawxe2fw", &fwArg, sizeof(fwArg)) && fwArg == 1) {
@@ -101,6 +104,7 @@ bool ClawXe2::start(IOService *provider) {
 }
 
 void ClawXe2::stop(IOService *provider) {
+    gucTeardown();               // M3: reset GuC before its buffers go away
     if (fwHeld_) forcewake(false);
     ggttSelfTestCleanup();
     gsm_ = nullptr;

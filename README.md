@@ -2,7 +2,7 @@
 
 Native macOS driver for the **Intel Arc 140V (Xe2_LPG, Lunar Lake)** in the **MSI Claw 8 AI+**, bare metal. Early research stage.
 
-> **Status: Milestone 2 of 8.** No acceleration, no Metal, no driver-owned display yet. The kext identifies the GPU and understands its memory (stolen memory, GGTT). Compiles against MacKernelSDK; never run on hardware.
+> **Status: Milestone 3 of 8.** No acceleration, no Metal, no driver-owned display yet. The kext identifies the GPU, understands its memory (stolen memory, GGTT) and can boot Intel's GuC scheduler firmware. Compiles against MacKernelSDK; never run on hardware.
 
 ## What ClawXe2.kext does today (M1)
 - Matches `8086:6420 / 64A0 / 64B0` (Linux `INTEL_LNL_IDS`).
@@ -17,17 +17,24 @@ Native macOS driver for the **Intel Arc 140V (Xe2_LPG, Lunar Lake)** in the **MS
 - `clawxe2fb=1`: draws a 256×256 magenta/green checkerboard into that framebuffer. **If it appears top-left on the Claw's screen, GGTT decoding is correct.**
 - `clawxe2ggtt=1`: writes a test PTE into a free GGTT slot, reads it back, restores it.
 
+## Milestone 3 (GuC firmware)
+- Programs the Xe2 PAT table, partitions WOPCM, resets and boots the **GuC** (`xe/lnl_guc_70.bin`, embedded at build time).
+- Reads the GPU's **hwconfig** table from the GuC (published as `xe2-guc-hwconfig`), which also proves the GuC can write system memory through our GGTT.
+- Registers and enables the **CT** (command transport) channel used for all later submission work.
+- Opt-in: `clawxe2guc=1`. Loading the GuC locks WOPCM until the next reboot.
+
 ## Build
 On macOS with Xcode CLT:
 ```sh
 git clone https://github.com/acidanthera/MacKernelSDK
+tools/fetch-firmware.sh    # GuC firmware + licence (without it M3 reports no-firmware-embedded)
 make SDK=MacKernelSDK      # → build/ClawXe2.kext
 ```
 Or download the `ClawXe2` artifact from GitHub Actions.
 
 ## Test on the Claw
 1. Get macOS booting: [`docs/OPENCORE.md`](docs/OPENCORE.md).
-2. Add `ClawXe2.kext` to OpenCore after Lilu; boot-args `-v -clawxe2dbg clawxe2fw=1 clawxe2fb=1 clawxe2ggtt=1`.
+2. Add `ClawXe2.kext` to OpenCore after Lilu; boot-args `-v -clawxe2dbg clawxe2fw=1 clawxe2fb=1 clawxe2ggtt=1 clawxe2guc=1`.
 3. Run `tools/clawxe2-report.sh`, open an issue with the output.
 
 On Windows, `tools/Get-ClawGpuIds.ps1` confirms the device ID first.
@@ -41,9 +48,10 @@ On Windows, `tools/Get-ClawGpuIds.ps1` confirms the device ID first.
 | `-clawxe2nom2` | Skip milestone 2 |
 | `clawxe2fb=1` | M2: draw test pattern via GGTT-resolved framebuffer |
 | `clawxe2ggtt=1` | M2: GGTT PTE write/read-back self-test |
+| `clawxe2guc=1` | M3: load GuC, read hwconfig, enable CT |
 
 ## Plan
 [`ROADMAP.md`](ROADMAP.md): GGTT → GuC/HuC/GSC firmware → PPGTT + submission → compute → Xe2LPD display → Mesa ANV → Metal. Each step is mapped to the Linux `xe` source it ports.
 
 ## License
-GPL-2.0-only (derived from Linux `drivers/gpu/drm/xe`).
+Driver: GPL-2.0-only (derived from Linux `drivers/gpu/drm/xe`). Embedded GuC firmware: Intel, redistributable in binary form under `LICENSE.xe` from linux-firmware.

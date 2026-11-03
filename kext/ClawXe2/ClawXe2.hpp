@@ -58,4 +58,37 @@ private:
     bool     drawTestPattern(unsigned pipe, uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t strideBytes);
     void     ggttSelfTest();
     void     ggttSelfTestCleanup();
+
+    // ---- M3: GuC firmware load, hwconfig, CT ----
+    struct GpuBuf {
+        IOBufferMemoryDescriptor *md = nullptr;
+        uint8_t  *cpu  = nullptr;
+        uint32_t  size = 0;        // page aligned
+        uint64_t  ggtt = 0;        // GGTT address, 0 if not mapped
+    };
+    GpuBuf   fwBuf_, adsBuf_, logBuf_, h2gBuf_, g2hBuf_, hwcfgBuf_;
+    uint64_t ggttCursor_ = 0;      // next free-window search starts below this address
+    bool     gucRunning_ = false;
+    bool     ctEnabled_  = false;
+    uint32_t gucUcodeSize_ = 0, gucRsaSize_ = 0, gucPrivDataSize_ = 0;
+    uint32_t wopcmBase_ = 0, wopcmSize_ = 0;
+
+    void     m3Run();
+    bool     bufAlloc(GpuBuf &b, uint32_t size, const char *what);
+    void     bufFree(GpuBuf &b);
+    bool     mcrLock();
+    void     mcrUnlock();
+    void     patProgram();
+    bool     gucParseFw(const uint8_t *fw, uint32_t len);
+    bool     wopcmInit();
+    bool     gucReset();
+    void     adsPopulateMinimal();
+    bool     gucUpload();
+    bool     gucWaitReady(uint32_t *status, uint32_t *ms);
+    bool     waitReg(uint32_t reg, uint32_t mask, uint32_t want, uint32_t timeoutUs, uint32_t *last = nullptr);
+    int64_t  gucMmioSend(const uint32_t *req, unsigned len, uint32_t *resp = nullptr);
+    bool     gucSelfCfg(uint16_t key, uint16_t len, uint64_t val);
+    bool     gucHwconfig();
+    bool     gucCtEnable();
+    void     gucTeardown();
 };

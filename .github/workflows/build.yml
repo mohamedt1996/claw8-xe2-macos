@@ -7,8 +7,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: MacKernelSDK
         run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK
+      - name: GuC firmware
+        run: |
+          tools/fetch-firmware.sh firmware
+          python3 tools/check-guc-fw.py firmware/lnl_guc_70.bin
       - name: Build
-        run: make SDK=MacKernelSDK
+        run: make SDK=MacKernelSDK FW_DIR=firmware
       - name: Inspect
         run: |
           file build/ClawXe2.kext/Contents/MacOS/ClawXe2
@@ -16,6 +20,8 @@ jobs:
           if nm -u build/ClawXe2.kext/Contents/MacOS/ClawXe2 | grep -q cxa_atexit; then
             echo "::error::kext imports __cxa_atexit (not exported by XNU)"; exit 1
           fi
+          nm build/ClawXe2.kext/Contents/MacOS/ClawXe2 | grep clawxe2_guc_fw
+          ls -l build/ClawXe2.kext/Contents/Resources
       - name: Package
         run: cd build && ditto -c -k --keepParent ClawXe2.kext ClawXe2-${{ github.sha }}.zip
       - uses: actions/upload-artifact@v4

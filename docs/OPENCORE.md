@@ -16,7 +16,7 @@ Target: macOS 26 Tahoe (last Intel release), OpenCore ≥ 1.0.5. Nobody has publ
 
 ## Graphics (no acceleration until M6/M8)
 - Do **not** inject an iGPU `AAPL,ig-platform-id`; macOS will use the GOP framebuffer.
-- Boot-args for bring-up: `-v keepsyms=1 debug=0x100 -clawxe2dbg clawxe2fw=1 clawxe2fb=1 clawxe2ggtt=1`
+- Boot-args for bring-up: `-v keepsyms=1 debug=0x100 -clawxe2dbg clawxe2fw=1 clawxe2fb=1 clawxe2ggtt=1 clawxe2guc=1`
 - Recovery entry: same EFI with `-clawxe2off`.
 
 ## SMBIOS
@@ -44,3 +44,8 @@ Target: macOS 26 Tahoe (last Intel release), OpenCore ≥ 1.0.5. Nobody has publ
 1. Boot with the args above.
 2. Look at the top-left of the screen during/after boot: a 256×256 magenta/green checkerboard with a white border = pass.
 3. `tools/clawxe2-report.sh` should show `xe2-stolen = ok`, `xe2-ggtt-decode = ok`, `xe2-ggtt-selftest = pte-readback-ok`.
+
+## M3 test
+1. Only after M2 passes. Boot with `clawxe2guc=1` added.
+2. Report should show `xe2-guc = running`, `xe2-guc-status-ukernel = 240` (0xF0), `xe2-guc-hwconfig-status = ok`, `xe2-guc-ct = enabled`.
+3. On failure, the report's `xe2-guc-error`, `xe2-guc-status-bootrom` and `xe2-guc-status-ukernel` say where it stopped (codes in `kext/ClawXe2/Xe2Guc.h`).
