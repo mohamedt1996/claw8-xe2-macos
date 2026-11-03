@@ -16,7 +16,7 @@ Target: macOS 26 Tahoe (last Intel release), OpenCore ≥ 1.0.5. Nobody has publ
 
 ## Graphics (no acceleration until M6/M8)
 - Do **not** inject an iGPU `AAPL,ig-platform-id`; macOS will use the GOP framebuffer.
-- Boot-args for bring-up: `-v keepsyms=1 debug=0x100 -clawxe2dbg clawxe2fw=1`
+- Boot-args for bring-up: `-v keepsyms=1 debug=0x100 -clawxe2dbg clawxe2fw=1 clawxe2fb=1 clawxe2ggtt=1`
 - Recovery entry: same EFI with `-clawxe2off`.
 
 ## SMBIOS
@@ -39,3 +39,8 @@ Target: macOS 26 Tahoe (last Intel release), OpenCore ≥ 1.0.5. Nobody has publ
 1. Copy `ClawXe2.kext` (CI artifact) to `EFI/OC/Kexts`, add to `config.plist → Kernel → Add` after Lilu.
 2. Boot, then run `tools/clawxe2-report.sh`.
 3. Expected: `xe2-status = xe2-lpg-detected`, `xe2-graphics-ip = 2004`, `xe2-xe-cores-geometry = 8`.
+
+## M2 test
+1. Boot with the args above.
+2. Look at the top-left of the screen during/after boot: a 256×256 magenta/green checkerboard with a white border = pass.
+3. `tools/clawxe2-report.sh` should show `xe2-stolen = ok`, `xe2-ggtt-decode = ok`, `xe2-ggtt-selftest = pte-readback-ok`.

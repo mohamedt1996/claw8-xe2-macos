@@ -12,7 +12,7 @@ KFLAGS  := $(ARCH) -mkernel -nostdlib -fno-builtin -fno-common -fno-stack-protec
 CXXFLAGS := $(KFLAGS) -std=c++17 -fno-rtti -fno-exceptions -fapple-kext
 CFLAGS   := $(KFLAGS) -std=c11
 
-OBJS := build/ClawXe2.o build/kmod_info.o
+OBJS := build/ClawXe2.o build/Xe2Mem.o build/kmod_info.o
 
 all: $(OUT)
 

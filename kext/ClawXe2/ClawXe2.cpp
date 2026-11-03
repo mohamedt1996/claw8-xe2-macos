@@ -7,6 +7,9 @@
 // Boot-args:  -clawxe2off   disable entirely
 //             -clawxe2dbg   verbose IOLog
 //             clawxe2fw=1   enable forcewake + topology probe
+//             -clawxe2nom2  skip milestone 2 (stolen/GGTT/scanout)
+//             clawxe2fb=1   M2: draw test pattern into GOP framebuffer via GGTT
+//             clawxe2ggtt=1 M2: GGTT PTE write/read-back self-test
 //
 // SPDX-License-Identifier: GPL-2.0-only  (logic derived from Linux drivers/gpu/drm/xe)
 
@@ -30,6 +33,11 @@ static bool hasBootFlag(const char *flag) {
 
 uint32_t ClawXe2::rd(uint32_t off) const { return OSReadLittleInt32(mmio_, off); }
 void     ClawXe2::wr(uint32_t off, uint32_t v) { OSWriteLittleInt32(mmio_, off, v); }
+uint64_t ClawXe2::rd64(uint32_t off) const {
+    uint32_t lo = rd(off), hi = rd(off + 4);
+    if (rd(off) != lo) { lo = rd(off); hi = rd(off + 4); }   // xe_mmio_read64_2x32 re-read
+    return (uint64_t(hi) << 32) | lo;
+}
 
 void ClawXe2::setNumber(const char *key, uint64_t v, unsigned bits) {
     setProperty(key, v, bits);
@@ -62,6 +70,7 @@ bool ClawXe2::start(IOService *provider) {
     setNumber("xe2-device-id", did, 16);
     setNumber("xe2-pci-revision", rev, 8);
     setProperty("xe2-milestone", "M1-probe");
+    setProperty("xe2-driver-version", "0.2.0");
 
     if (!mapBar0()) {
         setProperty("xe2-status", "bar0-map-failed");
@@ -69,6 +78,8 @@ bool ClawXe2::start(IOService *provider) {
     }
 
     readIpVersions();
+    if (graphicsIp_ == xe2::kGraphicsXe2Lpg && !hasBootFlag("-clawxe2nom2"))
+        m2Run();
 
     uint32_t fwArg = 0;
     if (PE_parse_boot_argn("clawxe2fw", &fwArg, sizeof(fwArg)) && fwArg == 1) {
@@ -91,6 +102,8 @@ bool ClawXe2::start(IOService *provider) {
 
 void ClawXe2::stop(IOService *provider) {
     if (fwHeld_) forcewake(false);
+    ggttSelfTestCleanup();
+    gsm_ = nullptr;
     OSSafeReleaseNULL(bar0_);
     mmio_ = nullptr;
     OSSafeReleaseNULL(pci_);
@@ -130,6 +143,8 @@ void ClawXe2::readIpVersions() {
 
     uint32_t gv = xe2::GMD_ARCH(g) * 100 + xe2::GMD_RELEASE(g);
     uint32_t mv = xe2::GMD_ARCH(m) * 100 + xe2::GMD_RELEASE(m);
+    graphicsIp_ = gv;
+    mediaIp_    = mv;
     setNumber("xe2-gmdid-graphics-raw", g);
     setNumber("xe2-gmdid-media-raw", m);
     setNumber("xe2-graphics-ip", gv);
