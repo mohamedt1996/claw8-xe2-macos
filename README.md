@@ -32,10 +32,22 @@ make SDK=MacKernelSDK      # → build/ClawXe2.kext
 ```
 Or download the `ClawXe2` artifact from GitHub Actions.
 
+## Make the installer USB (Windows)
+1. Wait for the GitHub Actions **build** to pass; it publishes release **efi-latest** with:
+   - `ClawMac-EFI.iso` — UEFI-bootable OpenCore EFI (ClawXe2 included), validated with `ocvalidate`
+   - `ClawMac-EFI.zip` — same EFI plus `macserial` / `macrecovery` for the USB maker
+2. On any Windows PC: download this repo, double-click **`windows/Make-ClawMacUSB.bat`**. It:
+   - downloads the EFI, generates your own SMBIOS serials,
+   - downloads macOS Tahoe recovery **from Apple** (needs Python 3; offers to install it),
+   - erases the USB stick you pick (types `ERASE` to confirm) and writes EFI + recovery.
+3. The ISO has no macOS inside (Apple's licence forbids redistributing it); it's for VMs or writing the EFI alone with Rufus. For the Claw use the USB from step 2.
+
+`-NoUsb` builds the USB contents into `%USERPROFILE%\ClawMac\usb` without touching any disk.
+
 ## Test on the Claw
 1. Get macOS booting: [`docs/OPENCORE.md`](docs/OPENCORE.md).
 2. Add `ClawXe2.kext` to OpenCore after Lilu; boot-args `-v -clawxe2dbg clawxe2fw=1 clawxe2fb=1 clawxe2ggtt=1 clawxe2guc=1`.
-3. Run `tools/clawxe2-report.sh`, open an issue with the output.
+3. Pick a test stage with `sudo tools/clawxe2-stage.sh 1|2|3|4`, reboot, then run `sudo tools/clawxe2-report.sh` and open an issue with the output.
 
 On Windows, `tools/Get-ClawGpuIds.ps1` confirms the device ID first.
 

@@ -1,5 +1,9 @@
 name: build
 on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: write
+
 jobs:
   kext:
     runs-on: macos-15
@@ -28,3 +32,73 @@ jobs:
         with:
           name: ClawXe2
           path: build/ClawXe2-*.zip
+
+  efi:
+    needs: kext
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xorriso mtools dosfstools unzip
+      - uses: actions/download-artifact@v4
+        with:
+          name: ClawXe2
+          path: dl/clawxe2
+      - name: Download OpenCore, kexts, SSDTs
+        run: |
+          set -eu
+          fetch() {  # repo  dest  [pattern]
+            mkdir -p "dl/$2"
+            gh release download -R "$1" -D "dl/$2" -p "${3:-*.zip}"
+            rm -f dl/$2/*DEBUG*.zip
+            for z in dl/$2/*.zip; do unzip -q -o "$z" -d "dl/$2/x"; done
+            echo "$1: $(ls dl/$2/*.zip | xargs -n1 basename)"
+          }
+          fetch acidanthera/OpenCorePkg      opencore '*RELEASE.zip'
+          fetch acidanthera/Lilu             kexts/lilu '*RELEASE.zip'
+          fetch acidanthera/VirtualSMC       kexts/vsmc '*RELEASE.zip'
+          fetch acidanthera/RestrictEvents   kexts/re   '*RELEASE.zip'
+          fetch acidanthera/NVMeFix          kexts/nvme '*RELEASE.zip'
+          fetch 1Revenger1/ECEnabler         kexts/ece
+          fetch b00t0x/CpuTopologyRebuild    kexts/ctr
+          fetch USBToolBox/kext              kexts/utb
+          fetch VoodooI2C/VoodooI2C          kexts/vi2c
+          for z in dl/clawxe2/*.zip; do unzip -q -o "$z" -d dl/kexts/clawxe2; done
+          git clone -q --depth 1 --filter=blob:none --sparse \
+            https://github.com/dortania/Getting-Started-With-ACPI dl/acpi
+          git -C dl/acpi sparse-checkout set extra-files/compiled
+      - name: Assemble EFI
+        run: |
+          set -eu
+          oc=$(dirname "$(dirname "$(find dl/opencore/x -path '*/X64/EFI' -type d | head -1)")")
+          python3 efi/build_efi.py --opencore "$oc" --kexts dl/kexts \
+            --ssdts dl/acpi/extra-files/compiled --out out
+          chmod +x "$oc/Utilities/ocvalidate/ocvalidate.linux"
+          "$oc/Utilities/ocvalidate/ocvalidate.linux" out/EFI/OC/config.plist
+          cp efi/README.txt out/README.txt
+          # Windows USB maker needs these OpenCore utilities
+          mkdir -p out/Utilities
+          cp -R "$oc/Utilities/macserial" "$oc/Utilities/macrecovery" out/Utilities/
+          echo "$(basename "$(ls dl/opencore/*.zip)")" > out/OPENCORE_VERSION.txt
+      - name: ISO + zip
+        run: |
+          set -eu
+          efi/make_iso.sh out ClawMac-EFI.iso
+          (cd out && zip -qr ../ClawMac-EFI.zip .)
+          ls -lh ClawMac-EFI.iso ClawMac-EFI.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClawMac-EFI
+          path: |
+            ClawMac-EFI.iso
+            ClawMac-EFI.zip
+      - name: Publish release efi-latest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          gh release view efi-latest >/dev/null 2>&1 || \
+            gh release create efi-latest --prerelease --title "ClawMac EFI (latest build)" \
+              --notes "Automated OpenCore EFI for the MSI Claw 8 AI+ with ClawXe2. Untested on hardware."
+          gh release upload efi-latest ClawMac-EFI.iso ClawMac-EFI.zip --clobber
+          gh release edit efi-latest --notes "Built from ${GITHUB_SHA::7}. OpenCore EFI for the MSI Claw 8 AI+ with ClawXe2. Untested on hardware. Use windows/Make-ClawMacUSB.bat to create the installer USB."
