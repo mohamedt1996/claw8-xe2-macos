@@ -1,0 +1,24 @@
+name: build
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  kext:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: MacKernelSDK
+        run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK
+      - name: Build
+        run: make SDK=MacKernelSDK
+      - name: Inspect
+        run: |
+          file build/ClawXe2.kext/Contents/MacOS/ClawXe2
+          nm -u build/ClawXe2.kext/Contents/MacOS/ClawXe2
+          if nm -u build/ClawXe2.kext/Contents/MacOS/ClawXe2 | grep -q cxa_atexit; then
+            echo "::error::kext imports __cxa_atexit (not exported by XNU)"; exit 1
+          fi
+      - name: Package
+        run: cd build && ditto -c -k --keepParent ClawXe2.kext ClawXe2-${{ github.sha }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClawXe2
+          path: build/ClawXe2-*.zip
