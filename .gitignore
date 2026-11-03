@@ -2,3 +2,4 @@ build/
 MacKernelSDK/
 firmware/
 *.o
+__pycache__/
