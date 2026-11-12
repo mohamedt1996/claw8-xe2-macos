@@ -1,0 +1,14 @@
+# The driver stack this port patches (MIT / PolyForm Noncommercial / LGPL; see its LICENSE, NOTICE, docs/LICENSING.md).
+UPSTREAM_URL=https://github.com/yusufklncc/intel-gpu-macos-driver
+UPSTREAM_COMMIT=cee7208903894dbc3b3f2b24aa72f260caf17936
+# The release whose unchanged userland (Mesa ANV, shader translator, VideoToolbox codecs, sigcheck) is reused.
+UPSTREAM_RELEASE=v0.1.4
+UPSTREAM_VERSION=0.1.4
+# This port's package version.
+CLAW_VERSION=0.1.4-lnl1
+# Mesa tree whose include/ (Vulkan headers 1.4.363) the Metal plugin is compiled against (mesa/README.md).
+MESA_URL=https://gitlab.freedesktop.org/mesa/mesa.git
+MESA_COMMIT=f01e9b07a91f7e7ab730edfbb383b083f146067b
+# linux-firmware: the Lunar Lake GuC (70.72.1) and HuC, checked by sha256.
+LNL_GUC_SHA=0583117763d2721b1b3a96c84d610229c18e644dce3a624b4e0ccc32952f5eaa
+LNL_HUC_SHA=320e765cbe42b0f5f95333794a6a00a4e67246d6ad8393b59b64efdc3506cfe9

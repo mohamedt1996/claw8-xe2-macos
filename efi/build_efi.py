@@ -2,12 +2,18 @@
 """Assemble an OpenCore EFI folder for the MSI Claw 8 AI+ (Lunar Lake, Core Ultra 7 258V).
 
 usage:
-  build_efi.py --opencore <unzipped OpenCore-*-RELEASE dir>
+  build_efi.py [--variant clawxe2|intelxe] --opencore <unzipped OpenCore-*-RELEASE dir>
                --kexts <dir containing *.kext (searched recursively, PlugIns skipped)>
                --ssdts <dir containing *.aml>
                --out <output dir, receives EFI/>
 
 The config is derived from OpenCore's Docs/Sample.plist with the settings from docs/OPENCORE.md.
+
+--variant intelxe (the IntelXe Metal driver, intelxe-lnl/): IntelXe.kext instead of ClawXe2.kext, SSDT-GFXOFF.aml, a
+GFX0 _DSM -> XDSM rename, SIP relaxed (csr-active-config 0x803), ReconnectGraphicsOnConnect off, and boot-args /
+csr-active-config in NVRAM > Delete. The IntelXe entries (kext, SSDT, rename) start disabled ("safe" mode: the GOP
+display for the macOS installer); tools/claw-intelxe.sh install (macOS) or Make-ClawMacUSB.ps1 -SetMode accel turns
+them on together with the AMFI boot-arg.
 SMBIOS serials are placeholders: the Windows USB maker (or the user) fills them with macserial.
 Nothing here has been booted on a Claw yet - see README.
 """
@@ -38,6 +44,13 @@ SSDTS = ["SSDT-EC-USBX-LAPTOP.aml", "SSDT-AWAC.aml", "SSDT-PNLF.aml"]
 DRIVERS = ["OpenRuntime.efi", "OpenHfsPlus.efi", "ResetNvramEntry.efi"]
 
 BOOT_ARGS = "-v keepsyms=1 debug=0x100 -lilubetaall -clawxe2dbg"
+BOOT_ARGS_INTELXE = "-v keepsyms=1 debug=0x100 -lilubetaall"   # accel mode appends amfi_get_out_of_my_way=0x1
+
+# --variant intelxe: what differs from the ClawXe2 variant
+INTELXE_KEXT = "IntelXe.kext"
+INTELXE_SSDT = "SSDT-GFXOFF.aml"
+GFX0_BASE = "\\_SB.PC00.GFX0"
+XDSM_COMMENT = "[intelxe] GFX0 _DSM to XDSM"
 
 # Comet Lake CPUID spoof (Kernel -> Emulate), as used for Alder Lake and newer hybrid laptops
 CPUID1_DATA = bytes.fromhex("55060A00" "00000000" "00000000" "00000000")
@@ -116,15 +129,22 @@ def order_by_dependencies(items: list) -> list:
     return result
 
 
-def build_config(sample: dict, kext_add: list, ssdts: list, drivers: list) -> dict:
+def build_config(sample: dict, kext_add: list, ssdts: list, drivers: list, variant: str = "clawxe2") -> dict:
     c = sample
     for k in [k for k in c if k.startswith("#")]:
         del c[k]
 
     # ACPI
-    c["ACPI"]["Add"] = [{"Comment": s, "Enabled": True, "Path": s} for s in ssdts]
+    c["ACPI"]["Add"] = [{"Comment": s, "Enabled": s != INTELXE_SSDT, "Path": s} for s in ssdts]
     c["ACPI"]["Delete"] = []
     c["ACPI"]["Patch"] = []
+    if variant == "intelxe":
+        # GFX0's own _DSM becomes XDSM so SSDT-GFXOFF can add one (it forwards non-Darwin calls); off until accel mode
+        c["ACPI"]["Patch"].append({
+            "Base": GFX0_BASE, "BaseSkip": 0, "Comment": XDSM_COMMENT, "Count": 1, "Enabled": False,
+            "Find": b"_DSM", "Limit": 0, "Mask": b"", "OemTableId": bytes(8), "Replace": b"XDSM", "ReplaceMask": b"",
+            "Skip": 0, "TableLength": 0, "TableSignature": bytes(4),
+        })
 
     # Booter (Alder Lake+ laptop profile)
     q = c["Booter"]["Quirks"]
@@ -180,6 +200,12 @@ def build_config(sample: dict, kext_add: list, ssdts: list, drivers: list) -> di
     add["csr-active-config"] = bytes(4)
     add["prev-lang:kbd"] = b"en-US:0"
     c["NVRAM"]["Delete"][apple] = ["ForceDisplayRotationInEFI"]
+    if variant == "intelxe":
+        # upstream README-INSTALL stage 2: SIP relaxed for the unsigned kexts in the Auxiliary KC, both keys deleted so
+        # the config's values apply at every boot (claw-intelxe.sh edits the config, not just NVRAM)
+        add["boot-args"] = BOOT_ARGS_INTELXE
+        add["csr-active-config"] = bytes.fromhex("03080000")
+        c["NVRAM"]["Delete"][apple] = ["ForceDisplayRotationInEFI", "boot-args", "csr-active-config"]
     c["NVRAM"]["WriteFlash"] = True
 
     # PlatformInfo: placeholders, filled by windows/Make-ClawMacUSB.ps1 via macserial
@@ -194,6 +220,12 @@ def build_config(sample: dict, kext_add: list, ssdts: list, drivers: list) -> di
     c["UEFI"]["Quirks"].update({"ReleaseUsbOwnership": True, "RequestBootVarRouting": True,
                                 "UnblockFsConnect": False})
     c["UEFI"]["Output"].update({"ProvideConsoleGop": True, "Resolution": "Max"})
+    if variant == "intelxe":
+        c["UEFI"]["Output"]["ReconnectGraphicsOnConnect"] = False   # true panics IntelXe's boot (upstream stage 2)
+        for e in c["Kernel"]["Add"]:
+            if e["BundlePath"] == INTELXE_KEXT:
+                e["Enabled"] = False   # safe mode until the /Library part is installed
+                e["Comment"] = "IntelXe.kext [intelxe accel]"
     c["UEFI"]["ReservedMemory"] = []
     return c
 
@@ -204,7 +236,13 @@ def main() -> None:
     ap.add_argument("--kexts", required=True)
     ap.add_argument("--ssdts", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--variant", choices=["clawxe2", "intelxe"], default="clawxe2")
     a = ap.parse_args()
+    wanted = list(WANTED_KEXTS)
+    ssdt_names = list(SSDTS)
+    if a.variant == "intelxe":
+        wanted = [k for k in wanted if k != "ClawXe2.kext"] + [INTELXE_KEXT]
+        ssdt_names.append(INTELXE_SSDT)
 
     oc_x64 = os.path.join(a.opencore, "X64", "EFI")
     sample = os.path.join(a.opencore, "Docs", "Sample.plist")
@@ -237,7 +275,7 @@ def main() -> None:
     acpi_dir = os.path.join(oc, "ACPI")
     os.makedirs(acpi_dir, exist_ok=True)
     ssdts = []
-    for s in SSDTS:
+    for s in ssdt_names:
         src = os.path.join(a.ssdts, s)
         if os.path.exists(src):
             shutil.copy2(src, acpi_dir)
@@ -250,7 +288,7 @@ def main() -> None:
     kext_dir = os.path.join(oc, "Kexts")
     os.makedirs(kext_dir, exist_ok=True)
     items = []
-    for name in WANTED_KEXTS:
+    for name in wanted:
         if name not in available:
             if name in OPTIONAL_KEXTS:
                 print(f"warning: optional {name} not found, skipped")
@@ -261,7 +299,9 @@ def main() -> None:
     kext_add = order_by_dependencies(items)
 
     with open(sample, "rb") as f:
-        cfg = build_config(plistlib.load(f), kext_add, ssdts, DRIVERS)
+        cfg = build_config(plistlib.load(f), kext_add, ssdts, DRIVERS, a.variant)
+    if a.variant == "intelxe" and INTELXE_SSDT not in ssdts:
+        die(f"{INTELXE_SSDT} not found under {a.ssdts}")
     with open(os.path.join(oc, "config.plist"), "wb") as f:
         plistlib.dump(cfg, f, sort_keys=False)
 

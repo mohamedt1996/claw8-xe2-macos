@@ -4,6 +4,14 @@ Native macOS driver for the **Intel Arc 140V (Xe2_LPG, Lunar Lake)** in the **MS
 
 > **Status: Milestone 3 of 8.** No acceleration, no Metal, no driver-owned display yet. The kext identifies the GPU, understands its memory (stolen memory, GGTT) and can boot Intel's GuC scheduler firmware. Compiles against MacKernelSDK; never run on hardware.
 
+## IntelXe: Metal on the Claw (Lunar Lake port)
+
+[`intelxe-lnl/`](intelxe-lnl/README.md) ports the IntelXe Metal driver stack (yusufklncc/intel-gpu-macos-driver, B580)
+to the Arc 140V: integrated memory path, Xe2_LPG workarounds, LNL GuC, the eDP panel. CI (`intelxe-lnl.yml`) builds
+the kexts, the Metal plugin, the macOS package and an OpenCore EFI, and publishes release `intelxe-latest`.
+`windows\Make-ClawMacUSB.bat` now makes the IntelXe USB by default (`-Variant clawxe2` for the old one;
+`-SetMode safe|accel` to switch the stick's EFI). Untested on hardware.
+
 ## What ClawXe2.kext does today (M1)
 - Matches `8086:6420 / 64A0 / 64B0` (Linux `INTEL_LNL_IDS`).
 - Maps BAR0, reads `GMD_ID` for graphics and media IP → expects **Xe2_LPG 20.04** / Xe2_LPM 20.00.

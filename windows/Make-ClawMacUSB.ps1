@@ -1,13 +1,19 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Creates a macOS installer USB for the MSI Claw 8 AI+ (OpenCore + ClawXe2 + macOS Tahoe recovery).
+  Creates a macOS installer USB for the MSI Claw 8 AI+ (OpenCore + the IntelXe Metal driver + macOS Tahoe recovery),
+  or switches an existing stick's EFI between "safe" and "accel" mode (-SetMode).
 
 .DESCRIPTION
   1. Downloads ClawMac-EFI.zip (OpenCore EFI built by this repo's CI, release "efi-latest").
   2. Generates unique SMBIOS data with OpenCore's macserial and writes it into config.plist.
   3. Downloads macOS recovery from Apple with OpenCore's macrecovery.py (needs Python 3).
-  4. Erases the chosen USB stick (GPT, FAT32) and copies EFI + com.apple.recovery.boot.
+  4. Erases the chosen USB stick (GPT, FAT32) and copies EFI + com.apple.recovery.boot, and (IntelXe variant) the
+     macOS driver package IntelXe-LNL-macOS.zip for after the install.
+
+  The IntelXe variant (default) starts in "safe" mode: GOP display for the installer, no acceleration. After macOS is
+  installed, run claw-intelxe.sh install on the Claw (README.txt on the stick); it switches the EFI to "accel".
+  If macOS then shows a black screen, run this script with -SetMode safe on Windows.
 
   macOS images are downloaded from Apple on your PC; they are never redistributed.
 
@@ -16,11 +22,16 @@
 .PARAMETER MacOS        tahoe (default) or sequoia.
 .PARAMETER WorkDir      Download/cache folder (default: %USERPROFILE%\ClawMac).
 .PARAMETER NoUsb        Prepare everything in WorkDir\usb but don't touch any disk.
+.PARAMETER Variant      intelxe (default: the IntelXe Metal driver port) or clawxe2 (the bring-up kext only).
+.PARAMETER SetMode      safe | accel: only edit EFI\OC\config.plist on -Drive (no download, no erase).
+.PARAMETER Drive        Drive letter of the stick for -SetMode (e.g. E:). Default: the volume labelled CLAWMAC.
 
 .EXAMPLE
   .\Make-ClawMacUSB.ps1
 .EXAMPLE
   .\Make-ClawMacUSB.ps1 -NoUsb      # build the USB contents into a folder only
+.EXAMPLE
+  .\Make-ClawMacUSB.ps1 -SetMode safe   # rescue: GOP display again (IntelXe off)
 #>
 [CmdletBinding()]
 param(
@@ -28,7 +39,10 @@ param(
     [string]$EfiZip,
     [ValidateSet('tahoe', 'sequoia')][string]$MacOS = 'tahoe',
     [string]$WorkDir = (Join-Path $env:USERPROFILE 'ClawMac'),
-    [switch]$NoUsb
+    [switch]$NoUsb,
+    [ValidateSet('intelxe', 'clawxe2')][string]$Variant = 'intelxe',
+    [ValidateSet('safe', 'accel')][string]$SetMode,
+    [string]$Drive
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # makes Invoke-WebRequest much faster on 5.1
@@ -36,6 +50,11 @@ $ProgressPreference = 'SilentlyContinue'   # makes Invoke-WebRequest much faster
 
 $Repo     = 'mohamedt1996/claw8-xe2-macos'
 $EfiUrl   = "https://github.com/$Repo/releases/download/efi-latest/ClawMac-EFI.zip"
+$IxEfiUrl = "https://github.com/$Repo/releases/download/intelxe-latest/ClawMac-IntelXe-EFI.zip"
+$IxPkgUrl = "https://github.com/$Repo/releases/download/intelxe-latest/IntelXe-LNL-macOS.zip"
+$AppleGuid = '7C436110-AB2A-4BBB-A880-FE41995C9F82'
+$Amfi      = 'amfi_get_out_of_my_way=0x1'
+if ($Variant -eq 'intelxe' -and -not $SetMode) { $EfiUrl = $IxEfiUrl }
 $Boards   = @{
     tahoe   = @{ Board = 'Mac-CFF7D910A743CAAF'; Extra = @('-os', 'latest') }
     sequoia = @{ Board = 'Mac-7BA5B2D9E42DDD94'; Extra = @() }
@@ -45,6 +64,79 @@ $Model    = 'MacBookPro16,2'
 function Step([string]$m) { Write-Host "`n==> $m" -ForegroundColor Cyan }
 function Ok([string]$m)   { Write-Host "    [OK] $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "    [!]  $m" -ForegroundColor Yellow }
+
+# ---------------------------------------------------------------- plist helpers
+function Read-Plist([string]$path) {
+    $settings = New-Object Xml.XmlReaderSettings
+    $settings.DtdProcessing = [Xml.DtdProcessing]::Ignore
+    $reader = [Xml.XmlReader]::Create($path, $settings)
+    $doc = New-Object Xml.XmlDocument
+    $doc.PreserveWhitespace = $true
+    $doc.Load($reader); $reader.Close()
+    return $doc
+}
+function Save-Plist($doc, [string]$path) {
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $w = New-Object IO.StreamWriter($path, $false, $utf8)
+    $doc.Save($w); $w.Close()
+}
+function Get-DictValue($dict, [string]$key) {
+    $k = $dict.SelectSingleNode("key[text()='$key']")
+    if (-not $k) { throw "plist key $key not found" }
+    $n = $k.NextSibling
+    while ($n -and $n.NodeType -ne [Xml.XmlNodeType]::Element) { $n = $n.NextSibling }
+    return $n
+}
+function Find-ArrayDict($array, [string]$key, [string]$value) {
+    foreach ($d in $array.ChildNodes) {
+        if ($d.NodeType -ne [Xml.XmlNodeType]::Element -or $d.Name -ne 'dict') { continue }
+        $k = $d.SelectSingleNode("key[text()='$key']")
+        if ($k -and (Get-DictValue $d $key).InnerText -eq $value) { return $d }
+    }
+    return $null
+}
+function Set-Enabled($doc, $dict, [bool]$on) {
+    $old = Get-DictValue $dict 'Enabled'
+    $new = $doc.CreateElement($(if ($on) { 'true' } else { 'false' }))
+    [void]$dict.ReplaceChild($new, $old)
+}
+# IntelXe EFI mode: the IntelXe.kext entry, SSDT-GFXOFF, the GFX0 _DSM rename and the AMFI boot-arg, together
+function Set-IntelXeMode([string]$config, [string]$mode) {
+    $doc  = Read-Plist $config
+    $root = $doc.SelectSingleNode('/plist/dict')
+    $on   = $mode -eq 'accel'
+    $k = Find-ArrayDict (Get-DictValue (Get-DictValue $root 'Kernel') 'Add') 'BundlePath' 'IntelXe.kext'
+    if (-not $k) { throw 'config.plist has no IntelXe.kext entry (not an IntelXe EFI: rebuild the stick)' }
+    Set-Enabled $doc $k $on
+    $a = Find-ArrayDict (Get-DictValue (Get-DictValue $root 'ACPI') 'Add') 'Path' 'SSDT-GFXOFF.aml'
+    if (-not $a) { throw 'config.plist has no SSDT-GFXOFF.aml entry' }
+    Set-Enabled $doc $a $on
+    $p = Find-ArrayDict (Get-DictValue (Get-DictValue $root 'ACPI') 'Patch') 'Comment' '[intelxe] GFX0 _DSM to XDSM'
+    if ($p) { Set-Enabled $doc $p $on } else { Warn 'no GFX0 _DSM rename patch' }
+    $nv = Get-DictValue (Get-DictValue (Get-DictValue $root 'NVRAM') 'Add') $AppleGuid
+    $ba = Get-DictValue $nv 'boot-args'
+    $tokens = @($ba.InnerText -split ' ' | Where-Object { $_ -and $_ -notlike 'amfi_get_out_of_my_way=*' })
+    if ($on) { $tokens += $Amfi }
+    $ba.InnerText = ($tokens -join ' ')
+    Copy-Item $config "$config.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    Save-Plist $doc $config
+    Ok "EFI mode $mode (boot-args: $($ba.InnerText))"
+}
+
+# ---------------------------------------------------------------- -SetMode: edit an existing stick only
+if ($SetMode) {
+    Step "Switching the stick's EFI to '$SetMode'"
+    if (-not $Drive) {
+        $v = Get-Volume -FileSystemLabel 'CLAWMAC' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $v -or -not $v.DriveLetter) { throw 'No volume labelled CLAWMAC: pass -Drive E: (the stick)' }
+        $Drive = "$($v.DriveLetter):"
+    }
+    $cfg = Join-Path ($Drive.TrimEnd('\') + '\') 'EFI\OC\config.plist'
+    if (-not (Test-Path $cfg)) { throw "$cfg not found" }
+    Set-IntelXeMode $cfg $SetMode
+    if ($SetMode -eq 'accel') { Warn 'accel needs IntelXeFB installed in macOS (claw-intelxe.sh install), or the display stays black.' }
+    return
+}
 
 # ---------------------------------------------------------------- admin
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -68,6 +160,15 @@ $config = Join-Path $efiRoot 'EFI\OC\config.plist'
 if (-not (Test-Path $config)) { throw "config.plist not found in $EfiZip" }
 if (Test-Path (Join-Path $efiRoot 'OPENCORE_VERSION.txt')) { Ok (Get-Content (Join-Path $efiRoot 'OPENCORE_VERSION.txt')) }
 Ok "EFI extracted to $efiRoot"
+$ixPkg = $null
+if ($Variant -eq 'intelxe') {
+    if (-not (Test-Path (Join-Path $efiRoot 'EFI\OC\Kexts\IntelXe.kext'))) { throw "$EfiZip has no IntelXe.kext: not the IntelXe EFI" }
+    $ixPkg = Join-Path $WorkDir 'IntelXe-LNL-macOS.zip'
+    Write-Host "    downloading $IxPkgUrl"
+    try { Invoke-WebRequest -Uri $IxPkgUrl -OutFile $ixPkg -UseBasicParsing }
+    catch { throw "Download failed: the IntelXe build (release 'intelxe-latest') is not published yet. ($($_.Exception.Message))" }
+    Ok "IntelXe driver package $([math]::Round((Get-Item $ixPkg).Length / 1MB)) MB (installed from macOS later)"
+}
 
 # ---------------------------------------------------------------- 2. SMBIOS
 Step "SMBIOS ($Model)"
@@ -81,20 +182,7 @@ $uuid   = [guid]::NewGuid().ToString().ToUpper()
 $rom    = New-Object byte[] 6
 (New-Object Security.Cryptography.RNGCryptoServiceProvider).GetBytes($rom)
 
-$settings = New-Object Xml.XmlReaderSettings
-$settings.DtdProcessing = [Xml.DtdProcessing]::Ignore
-$reader = [Xml.XmlReader]::Create($config, $settings)
-$xml = New-Object Xml.XmlDocument
-$xml.PreserveWhitespace = $true
-$xml.Load($reader); $reader.Close()
-
-function Get-DictValue($dict, [string]$key) {
-    $k = $dict.SelectSingleNode("key[text()='$key']")
-    if (-not $k) { throw "plist key $key not found" }
-    $n = $k.NextSibling
-    while ($n -and $n.NodeType -ne [Xml.XmlNodeType]::Element) { $n = $n.NextSibling }
-    return $n
-}
+$xml = Read-Plist $config
 $root    = $xml.SelectSingleNode('/plist/dict')
 $generic = Get-DictValue (Get-DictValue $root 'PlatformInfo') 'Generic'
 (Get-DictValue $generic 'SystemSerialNumber').InnerText = $serial
@@ -102,9 +190,7 @@ $generic = Get-DictValue (Get-DictValue $root 'PlatformInfo') 'Generic'
 (Get-DictValue $generic 'SystemUUID').InnerText        = $uuid
 (Get-DictValue $generic 'ROM').InnerText               = [Convert]::ToBase64String($rom)
 (Get-DictValue $generic 'SystemProductName').InnerText = $Model
-$utf8 = New-Object Text.UTF8Encoding($false)
-$writer = New-Object IO.StreamWriter($config, $false, $utf8)
-$xml.Save($writer); $writer.Close()
+Save-Plist $xml $config
 Ok "serial $serial, MLB $mlb, UUID $uuid"
 Set-Content -Path (Join-Path $WorkDir 'smbios.txt') -Value "Model $Model`nSerial $serial`nMLB $mlb`nUUID $uuid`nROM $([BitConverter]::ToString($rom))"
 
@@ -156,6 +242,7 @@ if ($NoUsb) {
     Copy-Item $recDir -Destination (Join-Path $usbStage 'com.apple.recovery.boot') -Recurse
     Copy-Item (Join-Path $efiRoot 'README.txt') $usbStage -ErrorAction SilentlyContinue
     Copy-Item (Join-Path $WorkDir 'smbios.txt') $usbStage
+    if ($ixPkg) { Copy-Item $ixPkg $usbStage }
     Ok "Copy the contents of $usbStage to a FAT32 USB stick."
     return
 }
@@ -187,7 +274,8 @@ Copy-Item (Join-Path $efiRoot 'EFI') $usb -Recurse -Force
 Copy-Item $recDir -Destination $usb -Recurse -Force
 Copy-Item (Join-Path $efiRoot 'README.txt') $usb -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $WorkDir 'smbios.txt') $usb
-Ok 'EFI, com.apple.recovery.boot, README, smbios.txt'
+if ($ixPkg) { Copy-Item $ixPkg $usb }
+Ok "EFI, com.apple.recovery.boot, README, smbios.txt$(if ($ixPkg) { ', IntelXe-LNL-macOS.zip' })"
 
 Write-Host @"
 
@@ -198,3 +286,9 @@ Done. Next:
   4. In the installer use Disk Utility to erase the EXTERNAL SSD (APFS), then install.
   5. Never select the internal Windows drive.
 "@ -ForegroundColor Green
+if ($ixPkg) { Write-Host @"
+  6. In macOS (Terminal), install the GPU driver and switch the EFI to accel, then reboot:
+       ditto -x -k /Volumes/CLAWMAC/IntelXe-LNL-macOS.zip ~/IntelXe
+       sudo ~/IntelXe/IntelXe-LNL-*/claw-intelxe.sh install
+  7. Black screen after that reboot: on Windows run  Make-ClawMacUSB.bat -SetMode safe
+"@ -ForegroundColor Green }

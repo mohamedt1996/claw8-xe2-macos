@@ -1,0 +1,100 @@
+name: intelxe-lnl
+# The IntelXe Metal driver stack ported to Lunar Lake (intelxe-lnl/), its OpenCore EFI for the Claw, and the release
+# "intelxe-latest" that windows/Make-ClawMacUSB.bat downloads.
+on:
+  push:
+    paths: ['intelxe-lnl/**', 'efi/**', 'tools/claw-intelxe.sh', 'windows/**', '.github/workflows/intelxe-lnl.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  driver:
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          brew install acpica >/dev/null
+          xcodebuild -version || true
+          xcrun --show-sdk-path
+      - name: Build (kexts, Metal plugin, package)
+        run: intelxe-lnl/build.sh
+      - name: Check the package
+        run: |
+          set -eu
+          z=$(ls intelxe-lnl/out/IntelXe-LNL-*-macOS.zip)
+          t=$(mktemp -d); ditto -x -k "$z" "$t"; d=$(ls -d "$t"/IntelXe-LNL-*)
+          (cd "$d/package" && shasum -a 256 -c SHA256SUMS >/dev/null) && echo "SHA256SUMS ok"
+          grep -q '64a0 Arc-140V' "$d/package/install.sh"
+          plutil -extract IOKitPersonalities xml1 -o - "$d/package/EFI/OC/Kexts/IntelXe.kext/Contents/Info.plist" | grep -q 0x64a08086
+          plutil -extract IOKitPersonalities xml1 -o - "$d/package/Library/Extensions/NMXAccel.kext/Contents/Info.plist" | grep -q 0x64a08086
+          codesign -v "$d/package/Library/Extensions/IntelXeFB.kext"
+          bash -n "$d/claw-intelxe.sh"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IntelXe-LNL
+          path: intelxe-lnl/out/*
+
+  efi:
+    needs: driver
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xorriso mtools dosfstools unzip
+      - uses: actions/download-artifact@v4
+        with:
+          name: IntelXe-LNL
+          path: dl/intelxe
+      - name: Download OpenCore, kexts, SSDTs
+        run: efi/fetch-deps.sh dl
+      - name: Assemble EFI (variant intelxe)
+        run: |
+          set -eu
+          unzip -q -o dl/intelxe/IntelXe-LNL-*-EFI.zip -d dl/intelxe/efi
+          mkdir -p dl/kexts/intelxe dl/ssdts
+          cp -R dl/intelxe/efi/Kexts/IntelXe.kext dl/kexts/intelxe/
+          cp dl/acpi/extra-files/compiled/*.aml dl/ssdts/ 2>/dev/null || true
+          cp dl/intelxe/efi/ACPI/SSDT-GFXOFF.aml dl/ssdts/
+          oc=$(dirname "$(dirname "$(find dl/opencore/x -path '*/X64/EFI' -type d | head -1)")")
+          python3 efi/build_efi.py --variant intelxe --opencore "$oc" --kexts dl/kexts --ssdts dl/ssdts --out out
+          chmod +x "$oc/Utilities/ocvalidate/ocvalidate.linux"
+          "$oc/Utilities/ocvalidate/ocvalidate.linux" out/EFI/OC/config.plist
+          cp efi/README.txt out/README.txt
+          cp intelxe-lnl/README.md out/README-IntelXe.md
+          mkdir -p out/Utilities
+          cp -R "$oc/Utilities/macserial" "$oc/Utilities/macrecovery" out/Utilities/
+          echo "$(basename "$(ls dl/opencore/*.zip)")" > out/OPENCORE_VERSION.txt
+          cp dl/intelxe/BUILDINFO.txt out/BUILDINFO-IntelXe.txt
+      - name: ISO + zip
+        run: |
+          set -eu
+          efi/make_iso.sh out ClawMac-IntelXe-EFI.iso
+          (cd out && zip -qr ../ClawMac-IntelXe-EFI.zip .)
+          cp dl/intelxe/IntelXe-LNL-*-macOS.zip IntelXe-LNL-macOS.zip
+          ls -lh ClawMac-IntelXe-EFI.* IntelXe-LNL-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClawMac-IntelXe-EFI
+          path: |
+            ClawMac-IntelXe-EFI.iso
+            ClawMac-IntelXe-EFI.zip
+            IntelXe-LNL-macOS.zip
+      - name: Publish release intelxe-latest
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -eu
+          notes="Built from ${GITHUB_SHA::7}: the IntelXe Metal driver ported to Lunar Lake (Arc 140V) for the MSI Claw 8 AI+, and its OpenCore EFI. UNTESTED ON HARDWARE. Make the USB with windows/Make-ClawMacUSB.bat; after installing macOS run claw-intelxe.sh install. Rescue: Make-ClawMacUSB.bat -SetMode safe.
+
+          $(cat dl/intelxe/BUILDINFO.txt)"
+          gh release view intelxe-latest >/dev/null 2>&1 || \
+            gh release create intelxe-latest --prerelease --title "IntelXe for the Claw (latest build)" --notes "$notes"
+          gh release upload intelxe-latest ClawMac-IntelXe-EFI.iso ClawMac-IntelXe-EFI.zip IntelXe-LNL-macOS.zip \
+            dl/intelxe/IntelXe-LNL-*-macOS.zip --clobber
+          gh release edit intelxe-latest --notes "$notes"

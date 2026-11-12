@@ -1,0 +1,858 @@
+From 470fdd6b2bb13b9bfdb86d21318d978ffddbffa3 Mon Sep 17 00:00:00 2001
+From: Mohamed <Mohamedt1996@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 16:04:57 +0200
+Subject: [PATCH] Lunar Lake (Arc 140V) integrated path for the MSI Claw 8 AI+
+
+- platform: LNL supported; build.py --platform lnl builds the xe/lnl GuC (70.72.1) in
+  and matches 8086:64a0/6420/64b0
+- memory: stolen DSM (GGC GMS less WOPCM, Wa_14019821291) as the kernel's device memory
+  at BAR2 offset 8 MB with the DM flag; user BOs system memory only (one mem region,
+  placement mask 1); page tables in 64 KB system-memory slabs walked with PAT WB;
+  LRCs in system memory; no UM queues; migrate identity over the DSM only
+- compression: compressed PAT indexes written as their uncompressed twins on iGPU;
+  the Metal plugin sets INTEL_DEBUG=noccs there (debug.intelxe.integrated)
+- workarounds per graphics IP: 20.04 drops 16025250150, 14019811474, 14021821874,
+  Wa_16023588340 and the VS_HIT tuning; adds 16018610683 and L3 RW flush-all; GuC WA
+  KLVs 13011645652/14022293748/16026508708/14025515070; 32-entry PAT, no PTA
+- no pcode init wait, SLPC floor RPn, compute MOCS uc, wmb without the posted write
+- IntelXeFB: BAR2 bounded by IntelXeDsmEnd; built-in panel: no rate changes, no VRR
+- media GT off by default on LNL (-intelxe_video)
+
+Untested on hardware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DWPhohPiosoytzNXAbWPKM
+---
+ kernel/IntelXe/IntelXe.cpp                    |  91 +++++++--
+ kernel/IntelXe/IntelXe.h                      |  12 +-
+ kernel/IntelXe/IntelXeClient.cpp              |   1 +
+ kernel/IntelXe/build.py                       |  21 +-
+ kernel/IntelXe/tests/platform_test.cpp        |   6 +-
+ kernel/IntelXe/xe_core.cpp                    | 186 ++++++++++++++++--
+ kernel/IntelXe/xe_platform.cpp                |   7 +-
+ kernel/IntelXeFB/IntelXeFB.cpp                |  21 +-
+ .../kexts/NVRM/accel/Info-NMX-IntelXe.plist   |   2 +-
+ nullmoth/plugin/NVMTLDevice.m                 |  19 +-
+ release/templates/install.sh                  |   2 +-
+ 11 files changed, 314 insertions(+), 54 deletions(-)
+
+diff --git a/kernel/IntelXe/IntelXe.cpp b/kernel/IntelXe/IntelXe.cpp
+index 9ba760c..c2337ac 100644
+--- a/kernel/IntelXe/IntelXe.cpp
++++ b/kernel/IntelXe/IntelXe.cpp
+@@ -203,6 +203,9 @@ SYSCTL_INT(_debug_intelxe, OID_AUTO, ctx_policies, CTLFLAG_RW, &gCtxPolicies, 0,
+ extern int gLrcVram;
+ SYSCTL_INT(_debug_intelxe, OID_AUTO, usm, CTLFLAG_RD, &gUsm, 0, "rb7j: GuC page fault (UM) queues on the primary GT (boot-arg -intelxe_nousm: 0)");
+ SYSCTL_INT(_debug_intelxe, OID_AUTO, lrc_vram, CTLFLAG_RW, &gLrcVram, 0, "new exec queues: LRC and ring in VRAM (xe_lrc_init XE_BO_FLAG_VRAM_IF_DGFX); 0 = system memory as before rb7");
++// claw-lnl: 1 on an integrated GPU (the Metal plugin turns Mesa's CCS off there: INTEL_DEBUG=noccs)
++static int gIntegrated = 0;
++SYSCTL_INT(_debug_intelxe, OID_AUTO, integrated, CTLFLAG_RD | CTLFLAG_ANYBODY, &gIntegrated, 0, "1: integrated GPU (system-memory path)");
+ SYSCTL_INT(_debug_intelxe, OID_AUTO, rc_yield, CTLFLAG_RW, &gRcYield, 0, "GuC render/compute yield policy (Linux: 80 ms, 20% to CCS) at the next GuC load or GT reset; 0 = not sent");
+ SYSCTL_INT(_debug_intelxe, OID_AUTO, job_timeout_ms, CTLFLAG_RW, &gJobTimeoutMs, 0, "job watchdog: ban a queue whose oldest job has not completed for this long; 0 = off");
+ SYSCTL_INT(_debug_intelxe, OID_AUTO, video, CTLFLAG_RW, &gVideoWanted, 0, "list the media GT's video decode engines (gt 1)");
+@@ -689,9 +692,9 @@ bool IntelXe::start(IOService *provider) {
+ 			opt->release();
+ 		};
+ 		nvInt("intelxe-gpu-profile", 0, 1, &gSlpcProfile);
++		gSlpcMin = 0;   // claw-lnl: the platform's default is set once the platform is known (below)
+ 		nvInt("intelxe-gpu-min-mhz", 0, 3000, &gSlpcMin);
+ 		nvInt("intelxe-gpu-max-mhz", 0, 3000, &gSlpcMax);
+-		if (gSlpcMin == 0) gSlpcMin = 1200;   // 0 in NVRAM: the default floor (Wa_14022085890)
+ 	}
+ 	int wf = 0;   // rb7q: debug.intelxe.surfvram_wsfull at boot (default 1)
+ 	if (intelxeBootArg("IntelXe", "intelxe_svwsfull", &wf, sizeof(wf))) gSurfVramWsFull = wf;
+@@ -734,6 +737,16 @@ bool IntelXe::start(IOService *provider) {
+ 	// The UM queues sit in VRAM here, so has_usm needs a discrete part too.
+ 	if (!plat->hasUsm || !plat->isDgfx) gUsm = 0;
+ 	if (plat->maxGtPerTile < 2) gVideoWanted = 0;
++	// The SLPC floor: BMG-G21's 1200 MHz (Wa_14022085890, xe_device_wa_oob.rules: BMG G21 only); elsewhere 0 = RPn, as
++	// pc_adjust_freq_bounds leaves it. NVRAM intelxe-gpu-min-mhz 0 means the default.
++	if (gSlpcMin == 0) gSlpcMin = plat->platform == XE_BATTLEMAGE ? 1200 : 0;
++	if (!plat->isDgfx) {
++		// claw-lnl: LRCs and rings in system memory (xe_lrc_init: XE_BO_FLAG_VRAM_IF_DGFX), and the media GT only when
++		// asked for (media 20.00 tables and the GSC-loaded HuC are untested): boot-arg -intelxe_video.
++		gLrcVram = 0;
++		if (!intelxeBootArg("IntelXe", "-intelxe_video", dummy, sizeof(dummy))) gVideoWanted = 0;
++		pci->setProperty("IntelXeIntegrated", kOSBooleanTrue);
++	}
+ 	pci->retain();
+ 	gDev = this;
+ 	sysctl_register_oid(&sysctl__debug_intelxe);
+@@ -761,6 +774,8 @@ bool IntelXe::start(IOService *provider) {
+ 	sysctl_register_oid(&sysctl__debug_intelxe_ctx_policies);
+ 	sysctl_register_oid(&sysctl__debug_intelxe_rc_yield);
+ 	sysctl_register_oid(&sysctl__debug_intelxe_lrc_vram);
++	gIntegrated = !plat->isDgfx;
++	sysctl_register_oid(&sysctl__debug_intelxe_integrated);
+ 	sysctl_register_oid(&sysctl__debug_intelxe_usm);
+ 	sysctl_register_oid(&sysctl__debug_intelxe_dispcheck);
+ 	sysctl_register_oid(&sysctl__debug_intelxe_gt_reset);
+@@ -792,8 +807,10 @@ bool IntelXe::start(IOService *provider) {
+ 	// as OpenCore DeviceProperties set it); without one the display section was titled "#display".
+ 	// The B570 (8086:e20c) is the same BMG-G21 with fewer Xe cores (#2).
+ 	static const char kB580[] = "Intel Arc B580 Graphics", kB570[] = "Intel Arc B570 Graphics";
+-	const bool b570 = pci->configRead16(kIOPCIConfigDeviceID) == 0xe20c;
+-	if (OSData *d = OSData::withBytes(b570 ? kB570 : kB580, b570 ? sizeof(kB570) : sizeof(kB580))) { pci->setProperty("model", d); d->release(); }
++	static const char kArc140V[] = "Intel Arc 140V Graphics", kArcLnl[] = "Intel Arc Graphics (Lunar Lake)";
++	const uint16_t did = pci->configRead16(kIOPCIConfigDeviceID);
++	const char *model = did == 0xe20c ? kB570 : did == 0x64a0 ? kArc140V : plat->platform == XE_LUNARLAKE ? kArcLnl : kB580;
++	if (OSData *d = OSData::withBytes(model, (unsigned)strlen(model) + 1)) { pci->setProperty("model", d); d->release(); }
+ 	registerService();
+ 	// System sleep: two power states under the PCI device (xe_pm_suspend / xe_pm_resume in setPowerState), and the ReBAR
+ 	// state to restore on wake (pci_save_rebar_state).
+@@ -890,6 +907,7 @@ void IntelXe::stop(IOService *provider) {
+ 	sysctl_unregister_oid(&sysctl__debug_intelxe_ctx_policies);
+ 	sysctl_unregister_oid(&sysctl__debug_intelxe_rc_yield);
+ 	sysctl_unregister_oid(&sysctl__debug_intelxe_lrc_vram);
++	sysctl_unregister_oid(&sysctl__debug_intelxe_integrated);
+ 	sysctl_unregister_oid(&sysctl__debug_intelxe_usm);
+ 	sysctl_unregister_oid(&sysctl__debug_intelxe_dispcheck);
+ 	sysctl_unregister_oid(&sysctl__debug_intelxe_gt_reset);
+@@ -1156,6 +1174,11 @@ int IntelXe::waitDeviceReady() {
+ 	}
+ 	cfgMs = elapsedMs();
+ 	if (!mapBar0()) return ENXIO;
++	// xe_pcode_probe_early: DGFX_PCODE_STATUS exists on discrete parts only (xe_device_probe_early: IS_DGFX)
++	if (!gXePlat->isDgfx) {
++		say("device ready: config space after %llu ms (integrated: no pcode init wait)\n", cfgMs);
++		return 0;
++	}
+ 	uint32_t mb = 0, d0 = 0, tries = 0;
+ 	for (;;) {
+ 		IOLockLock(gPcodeLock);
+@@ -1288,7 +1311,7 @@ void IntelXe::gucStatus(uint32_t gt) {
+ // pat_media_pta = xe2_pat_pta on dGFX; regs_are_mcr false for media < 20, uc_index 3).
+ void IntelXe::programPatMocs(uint32_t gt) {
+ 	#define XE2_PAT(np, comp, clos, l3, l4, coh) ((np) << 10 | (comp) << 9 | (clos) << 6 | (l3) << 4 | (l4) << 2 | (coh))
+-	static const uint32_t pat[28] = {
++	static const uint32_t pat[32] = {
+ 		XE2_PAT(0, 0, 0, 0, 3, 0), XE2_PAT(0, 0, 0, 0, 3, 2), XE2_PAT(0, 0, 0, 0, 3, 3), XE2_PAT(0, 0, 0, 3, 3, 0),
+ 		XE2_PAT(0, 0, 0, 3, 0, 2), XE2_PAT(0, 0, 0, 3, 3, 2), XE2_PAT(1, 0, 0, 1, 3, 0), XE2_PAT(0, 0, 0, 3, 0, 3),
+ 		XE2_PAT(0, 0, 0, 3, 0, 0), XE2_PAT(0, 1, 0, 0, 3, 0), XE2_PAT(0, 1, 0, 3, 0, 0), XE2_PAT(1, 1, 0, 1, 3, 0),
+@@ -1296,10 +1319,14 @@ void IntelXe::programPatMocs(uint32_t gt) {
+ 		0, 0, 0, 0,
+ 		XE2_PAT(0, 0, 1, 0, 3, 0), XE2_PAT(0, 1, 1, 0, 3, 0), XE2_PAT(0, 0, 1, 0, 3, 2), XE2_PAT(0, 0, 1, 0, 3, 3),
+ 		XE2_PAT(0, 0, 2, 0, 3, 0), XE2_PAT(0, 1, 2, 0, 3, 0), XE2_PAT(0, 0, 2, 0, 3, 2), XE2_PAT(0, 0, 2, 0, 3, 3),
++		XE2_PAT(0, 0, 3, 0, 3, 0), XE2_PAT(0, 1, 3, 0, 3, 0), XE2_PAT(0, 0, 3, 0, 3, 2), XE2_PAT(0, 0, 3, 0, 3, 3),
+ 	};
+-	for (int i = 0; i < 28; i++) wr(gt + patReg(i), pat[i]);
++	// xe_pat_init_early: n_entries 28 on 20.01 (Wa_16023588340, CLOS3 off), the whole xe2_pat_table (32) otherwise;
++	// pat_primary_pta / pat_media_pta only on dGFX (xe2_program_pat writes PTA only when set)
++	const int n = gXePlat->patEntries <= 32 ? gXePlat->patEntries : 32;
++	for (int i = 0; i < n; i++) wr(gt + patReg(i), pat[i]);
+ 	wr(gt + PAT_ATS, XE2_PAT(0, 0, 0, 0, 3, 3));
+-	wr(gt + PAT_PTA, XE2_PAT(0, 0, 0, 0, 3, 0));
++	if (gXePlat->isDgfx) wr(gt + PAT_PTA, XE2_PAT(0, 0, 0, 0, 3, 0));
+ 	#undef XE2_PAT
+ 	static const uint32_t mocs[5] = {0x00c, 0x10c, 0x130, 0x13c, 0x100};   // IG_PAT 8, L3 5:4, L4 3:2
+ 	for (int i = 0; i < 16; i++) wr(gt + GLOBAL_MOCS0 + i * 4, mocs[i < 5 ? i : 4]);
+@@ -1607,8 +1634,10 @@ int IntelXe::gtReset() {
+ 	IOLockUnlock(gH2gLock[0]);
+ 	int err = firstBatchSetupOnly();   // engines, workarounds, GuC load, hwconfig, CT
+ 	if (!err && forcewake(true)) {
+-		wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 as bringUp applies it: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
+-		wr(0xb194 + 3 * 8, 0xf);             //                                     XEHPC_L3CLOS_MASK(3)
++		if (gXePlat->graphicsVerx100 == 2001) {   // claw-lnl: Wa_16023588340 is graphics 20.01 only
++			wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 as bringUp applies it: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
++			wr(0xb194 + 3 * 8, 0xf);             //                                     XEHPC_L3CLOS_MASK(3)
++		}
+ 		pcStart();
+ 		forcewake(false);
+ 	}
+@@ -1762,8 +1791,10 @@ int IntelXe::gpuResume() {
+ 	IOLockUnlock(gH2gLock[0]);
+ 	if ((err = firstBatchSetupOnly())) return err;
+ 	if (forcewake(true)) {
+-		wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 (bringUp)
+-		wr(0xb194 + 3 * 8, 0xf);
++		if (gXePlat->graphicsVerx100 == 2001) {   // claw-lnl: Wa_16023588340 is graphics 20.01 only
++			wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 (bringUp)
++			wr(0xb194 + 3 * 8, 0xf);
++		}
+ 		pcStart();
+ 		forcewake(false);
+ 	}
+@@ -2043,12 +2074,20 @@ int IntelXe::loadGuc(bool full, uint32_t gt) {
+ 	ads->ads.private_data = aG + (uint32_t)privOff;
+ 	if (full) {   // guc_waklv_init for graphics 20.01: 18024947630, 16022287689, 14022293748/22019794406, 16026508708
+ 		static const uint32_t klvs[] = {0x9005u << 16, 0x9007u << 16, 0x9009u << 16, 0x900bu << 16};
++		// claw-lnl: graphics 20.04 (xe_wa_oob.rules): 13011645652 (NP_RD_WRITE_TO_CLEAR_RCSM_AT_CGP_LATE_RESTORE, one
++		// dword 0xC40), 14022293748/22019794406, 16026508708, 14025515070 (CLR_CS_INDIRECT_RING_STATE_IF_IDLE, fw >= 70.53)
++		static const uint32_t lklvs[] = {0x9008u << 16 | 1, 0xc40, 0x9009u << 16, 0x900bu << 16, 0x900eu << 16};
+ 		// media 13.01: 16026508708 (RESET_BB_STACK_PTR_ON_VF_SWITCH), 14025515070 (CLR_CS_INDIRECT_RING_STATE, fw >= 70.53)
+ 		static const uint32_t mklvs[] = {0x900bu << 16, 0x900eu << 16};
++		// media 20.00 (LNL): 16026508708 only
++		static const uint32_t lmklvs[] = {0x900bu << 16};
++		const bool lnl = gXePlat->platform == XE_LUNARLAKE;
++		const uint32_t *k = gt ? (lnl ? lmklvs : mklvs) : (lnl ? lklvs : klvs);
++		const uint32_t ksz = gt ? (lnl ? sizeof(lmklvs) : sizeof(mklvs)) : (lnl ? sizeof(lklvs) : sizeof(klvs));
+ 		const uint32_t off = (sizeof(guc_ads_blob) + 63) & ~63u;
+-		memcpy(static_cast<uint8_t *>(adsM->getBytesNoCopy()) + off, gt ? mklvs : klvs, gt ? sizeof(mklvs) : sizeof(klvs));
++		memcpy(static_cast<uint8_t *>(adsM->getBytesNoCopy()) + off, k, ksz);
+ 		ads->ads.wa_klv_addr_lo = aG + off;
+-		ads->ads.wa_klv_size = gt ? sizeof(mklvs) : sizeof(klvs);
++		ads->ads.wa_klv_size = ksz;
+ 	}
+ 	if (full) adsRegsets(ads, static_cast<uint8_t *>(adsM->getBytesNoCopy()) + regsetOff, aG + (uint32_t)regsetOff, 0x1000, gt);
+ 	// rb7j: guc_um_init_params (has_usm, primary GT): the three UM queues, by DPA (pre-Xe3p: the GAM writes them through
+@@ -2589,7 +2628,8 @@ int IntelXe::firstBatchSetupOnly() {
+ 		if (ccs & 1u << i) gEngines[gNumEngines++] = {4, l++, i, 4, ccsBase[i], 0x3000, 0x3000u + i * 0x1000};   // COMPUTE: + 2 pages
+ 	for (uint32_t i = 0; i < gNumEngines; i++) {
+ 		const XeEngine &e = gEngines[i];
+-		uint32_t readMocs = e.drmClass == 4 ? 4 : 3;     // dGFX Xe2 compute reads through the WB MOCS entry
++		// hw_engine_setup_default_state: dGFX Xe2 compute reads through the WB MOCS entry, everything else uc_index
++		uint32_t readMocs = e.drmClass == 4 && gXePlat->isDgfx ? 4 : 3;
+ 		wr(e.base + 0xc4, 0x3f7eu << 16 | 3u << 8 | readMocs << 1);   // RING_CMD_CCTL
+ 		wr(e.base + 0x98, ~0u);                                       // RING_HWSTAM
+ 		wr(e.base + 0x29c, 8u << 16 | 8u);                            // GFX_MODE: GFX_DISABLE_LEGACY_MODE
+@@ -2607,12 +2647,23 @@ int IntelXe::firstBatchSetupOnly() {
+ 	auto setBits = [&](uint32_t r, uint32_t b) { wr(r, rd(r) | b); };
+ 	auto masked = [&](uint32_t r, uint32_t b) { wr(r, b << 16 | b); };
+ 	auto field = [&](uint32_t r, uint32_t m, uint32_t v) { wr(r, (rd(r) & ~m) | v); };
+-	field(0xb0c8, 0xfffff000, 0x11111000);            // LSN_VC_REG2 weights 1 (16025250150)
+-	setBits(0xe7cc, 1u << 8 | 1u << 15 | 1u << 12);   // LSC_CHICKEN_BIT_0_UDW (16025250150, 16018712365, 14018471104)
+-	setBits(0xe7c8, 1u << 13 | 1u << 26);             // LSC_CHICKEN_BIT_0 (18032247524, 14019811474)
++	// claw-lnl: per graphics IP. 20.01 (BMG) as before; 20.04 (LNL, Xe2_LPG) drops the 20.01-only 16025250150,
++	// 14019811474 and 14021821874/14022954250 (2001-2002) and adds 16018610683 (SLM_WMTP_RESTORE) and the L3 RW
++	// flush-all tuning (xe_wa.c, xe_tuning.c at v7.2).
++	const bool g2001 = gXePlat->graphicsVerx100 == 2001, g2004 = gXePlat->graphicsVerx100 == 2004;
++	if (g2001) {
++		field(0xb0c8, 0xfffff000, 0x11111000);            // LSN_VC_REG2 weights 1 (16025250150)
++		setBits(0xe7cc, 1u << 8);                         // LSC_CHICKEN_BIT_0_UDW L3_128B_256B_WRT_DIS (16025250150)
++		setBits(0xe7c8, 1u << 26);                        // LSC_CHICKEN_BIT_0 WR_REQ_CHAINING_DIS (14019811474)
++	}
++	setBits(0xe7cc, 1u << 15 | 1u << 12);             // LSC_CHICKEN_BIT_0_UDW (16018712365, 14018471104)
++	setBits(0xe7c8, 1u << 13);                        // LSC_CHICKEN_BIT_0 SEQUENTIAL_ACCESS_UPGRADE_DISABLE (18032247524)
+ 	masked(0xe49c, 1u << 14);                         // ROW_CHICKEN3 XE2_EUPEND_CHK_FLUSH_DIS (14020338487)
+ 	masked(0xe194, 1u << 6);                          // HALF_SLICE_CHICKEN7 CLEAR_OPTIMIZATION_DISABLE (14021402888)
+-	masked(0xe4c4, 1u << 6 | 1u << 12);               // TDL_TSL_CHICKEN RES_CHK_SPR_DIS, STK_ID_RESTRICT
++	masked(0xe4c4, 1u << 6);                          // TDL_TSL_CHICKEN RES_CHK_SPR_DIS (13012615864)
++	if (g2001) masked(0xe4c4, 1u << 12);              // TDL_TSL_CHICKEN STK_ID_RESTRICT (14021821874, 2001-2002)
++	if (g2004) masked(0xe4c4, 1u << 11);              // TDL_TSL_CHICKEN SLM_WMTP_RESTORE (16018610683, 2004)
++	if (g2004) setBits(0xb154, 1u << 17);             // SCRATCH3_LBCF RWFLUSHALLEN (tuning: L3 RW flush all cache)
+ 	masked(0xe48c, 1u << 9);                          // ROW_CHICKEN4 DISABLE_TDL_PUSH (18034896535)
+ 	masked(0xe4f0, 1u << 1);                          // ROW_CHICKEN EARLY_EOT_DIS (16018737384)
+ 	setBits(0xe530, 1u << 10);                        // RT_CTRL DIS_NULL_QUERY (tuning)
+@@ -2770,8 +2821,10 @@ int IntelXe::vramTest() {
+ 	say("BAR2 phys 0x%llx len 0x%llx\n", bar2->getPhysicalAddress(), bar2->getLength());
+ 	if (!forcewake(true)) return ETIMEDOUT;
+ 	// xe_gt_enable_host_l2_vram (Wa_16023588340, graphics 20.01)
+-	wr(0x4194, rd(0x4194) | 1u << 6);   // XE2_GAMREQSTRM_CTRL: CG_DIS_CNTLBUS
+-	wr(0xb194 + 3 * 8, 0xf);             // XEHPC_L3CLOS_MASK(3)
++	if (gXePlat->graphicsVerx100 == 2001) {   // claw-lnl: Wa_16023588340 is graphics 20.01 only
++		wr(0x4194, rd(0x4194) | 1u << 6);   // XE2_GAMREQSTRM_CTRL: CG_DIS_CNTLBUS
++		wr(0xb194 + 3 * 8, 0xf);             // XEHPC_L3CLOS_MASK(3)
++	}
+ 
+ 	// CPU only: 4 KB pattern at three places in the CPU-visible window.
+ 	auto *v = reinterpret_cast<volatile uint32_t *>(bar2->getVirtualAddress());
+diff --git a/kernel/IntelXe/IntelXe.h b/kernel/IntelXe/IntelXe.h
+index 91c5c1f..3979676 100644
+--- a/kernel/IntelXe/IntelXe.h
++++ b/kernel/IntelXe/IntelXe.h
+@@ -64,6 +64,7 @@ struct IntelXeDpaRun { uint64_t dpa, len; };   // intelxeScanoutPin v2: one phys
+ // Without a mapper (OpenCore DisableIoMapper) the segments are the physical addresses, as before. Up to 46-bit device
+ // addresses (Xe2 dGPU dma_mask_size).
+ extern IOMapper *gDmaMapper;   // the B580's own mapper (IOMapper::copyMapperForDevice), nullptr = the system default
++extern const XePlatformDesc *gXePlat;   // (defined below as well; used by inline members)
+ struct DmaMap {
+ 	IODMACommand *cmd {nullptr};
+ 	IODMACommand::Segment64 *seg {nullptr};
+@@ -180,6 +181,7 @@ public:
+ 	uint32_t rebarOff {0}, rebarCtl[6] {}, bar2Lo {0}, bar2Hi {0}, rebarN {0};   // pci_save_rebar_state
+ 	void bringUpAsync();   // bring-up on a thread call after start() (xe_device_probe), -intelxe_lazy: on the first ioctl
+ 	uint64_t vramUsableEnd();
++	uint64_t dsmEndIntegrated();   // claw-lnl: the stolen DSM's end as a DPA (0: none)
+ 	bool ctBroken[2] {};   // G2H channel found corrupted (status or offsets): no more reads until the next CT setup
+ 	// H2G made no forward progress for 1 s (guc_ct_send_locked "No forward process on H2G": CT_DEAD(DEADLOCK)): every
+ 	// send fails at once until the next CT setup, and the primary GT is reset (kick_reset)
+@@ -208,7 +210,8 @@ public:
+ 	// xe_device_wmb on dGFX: the CPU's write-combined stores to VRAM through BAR2 are pushed out (sfence) and ordered
+ 	// before what follows by a posted MMIO write (VF_CAP_REG 0x1901f8, which needs no forcewake), as xe does after
+ 	// writing a ring or a CT buffer in VRAM (xe_lrc_write_ring, h2g_write).
+-	void deviceWmb() { asm volatile("sfence" : : : "memory"); wr(0x1901f8, 0); }
++	// claw-lnl: the posted MMIO write is IS_DGFX only in xe_device_wmb (wmb() alone on an iGPU)
++	void deviceWmb() { asm volatile("sfence" : : : "memory"); if (gXePlat && gXePlat->isDgfx) wr(0x1901f8, 0); }
+ 	// xe_device_l2_flush (Wa_16023588340): XE2_GLOBAL_INVAL under GT forcewake, waited up to 1 ms; false on timeout
+ 	bool l2Flush();
+ 	void ggttClear(uint32_t ggtt, uint32_t len, uint32_t gt = 0);
+@@ -249,6 +252,13 @@ extern IntelXe *gDev;
+ extern const XePlatformDesc *gXePlat;
+ extern uint16_t gXePlatId;
+ static inline IOMemoryMap *gDevVram() { return gDev->vramMap(); }
++// claw-lnl: the integrated path (Lunar Lake). On an integrated GPU the "VRAM" of this driver is the stolen DSM, which BAR2
++// (LMEMBAR) maps with GSM at offset 0 and DSM from 8 MB, and which the GPU addresses with the DM flag at its BAR2 offset
++// (xe_ttm_stolen_mgr.c detect_lmembar_integrated: "DSMBASE = GSMBASE + 8MB", xe_bo_is_stolen_devmem). User BOs and page
++// tables are in system memory there, as xe places XE_BO_FLAG_VRAM_IF_DGFX objects.
++static inline bool xeIgpu() { return gXePlat && !gXePlat->isDgfx; }
++static inline bool xeBmg() { return gXePlat && gXePlat->platform == XE_BATTLEMAGE; }
++static constexpr uint64_t kIgpuDsmStart = 8ull << 20;   // DSM's BAR2 offset (and DPA) on graphics >= 12.70 integrated
+ 
+ 
+ // GGTT layout above the 8 MB WOPCM (bring-up objects), then a 16 MB window per exec queue LRC from lrcPoolG.
+diff --git a/kernel/IntelXe/IntelXeClient.cpp b/kernel/IntelXe/IntelXeClient.cpp
+index 7a8c8a2..859e9bf 100644
+--- a/kernel/IntelXe/IntelXeClient.cpp
++++ b/kernel/IntelXe/IntelXeClient.cpp
+@@ -184,6 +184,7 @@ IOReturn IOAccelIntelXeClient::clientMemoryForType(UInt32 type, IOOptionBits *op
+ }
+ 
+ bool IntelXe::l2Flush() {
++	if (gXePlat->graphicsVerx100 != 2001) return true;   // claw-lnl: xe_device_l2_flush only under Wa_16023588340 (20.01)
+ 	if (!forcewake(true)) return false;
+ 	wr(0xb404, 1);   // XE2_GLOBAL_INVAL
+ 	uint32_t last = 0;
+diff --git a/kernel/IntelXe/build.py b/kernel/IntelXe/build.py
+index fab9c8d..9c5a733 100644
+--- a/kernel/IntelXe/build.py
++++ b/kernel/IntelXe/build.py
+@@ -26,10 +26,17 @@ HERE=Path(__file__).resolve().parent          # kernel/IntelXe
+ REPO=HERE.parent.parent
+ FBDIR=HERE.parent/'IntelXeFB'                    # kernel/IntelXeFB
+ VER=(REPO/'VERSION').read_text().strip()       # the release that last rebuilt the kext
+-GUC='bmg_guc_70.bin'
+-GUC_SHA='de81c75f46a127c33cd59f604d800e9ffc7ed3495967ba0d8767cd6985ab398b'  # GuC 70.72.1
+-HUC='bmg_huc.bin'
+-HUC_SHA='747452aa8c4ed7760c68a80f3d913eafde9304d6f4db481e3f2aebb0a818bf15'  # HuC 8.2.10
++# claw-lnl: one platform's firmware is built in (IntelXe::start checks the platform descriptor names it), so a build is
++# for one family: --platform bmg (Arc B580/B570, the default) or lnl (Lunar Lake: Arc 140V/130V, MSI Claw 8 AI+).
++PLATFORMS={
++ 'bmg':dict(guc='bmg_guc_70.bin',guc_sha='de81c75f46a127c33cd59f604d800e9ffc7ed3495967ba0d8767cd6985ab398b',   # GuC 70.72.1
++            huc='bmg_huc.bin',huc_sha='747452aa8c4ed7760c68a80f3d913eafde9304d6f4db481e3f2aebb0a818bf15',   # HuC 8.2.10
++            match='0xe20b8086 0xe20c8086'),
++ 'lnl':dict(guc='lnl_guc_70.bin',guc_sha='0583117763d2721b1b3a96c84d610229c18e644dce3a624b4e0ccc32952f5eaa',   # GuC 70.72.1
++            huc='lnl_huc.bin',huc_sha='320e765cbe42b0f5f95333794a6a00a4e67246d6ad8393b59b64efdc3506cfe9',   # GSC-loaded HuC
++            match='0x64a08086 0x64208086 0x64b08086'),
++}
++GUC=HUC=GUC_SHA=HUC_SHA=MATCH=None
+ def run(cmd): subprocess.run([str(x) for x in cmd],check=True,cwd=HERE)
+ def main():
+  p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
+@@ -40,8 +47,12 @@ def main():
+   help='MacKernelSDK checkout (default: $MACKERNELSDK or <repo>/external/MacKernelSDK)')
+  p.add_argument('--firmware',type=Path,default=REPO/'firmware',help='directory with bmg_guc_70.bin and bmg_huc.bin')
+  p.add_argument('--only',choices=['IntelXe','IntelXeFB'],help='build one kext only')
++ p.add_argument('--platform',choices=sorted(PLATFORMS),default='bmg',help='GPU family to build for (firmware, IOPCIMatch)')
+  p.add_argument('--surfvram',type=int,choices=range(0,4),help='IntelXeSurfVramDefault in the personality: debug.intelxe.surfvram at boot (boot-arg intelxe_surfvram=N wins)')
+  a=p.parse_args();out=a.output.resolve()
++ global GUC,HUC,GUC_SHA,HUC_SHA,MATCH
++ pl=PLATFORMS[a.platform];GUC,GUC_SHA,HUC,HUC_SHA,MATCH=pl['guc'],pl['guc_sha'],pl['huc'],pl['huc_sha'],pl['match']
++ print(f'platform {a.platform}: {GUC}, {HUC}, IOPCIMatch {MATCH}')
+  sdk=a.sdk.resolve()
+  if not (sdk/'Headers').is_dir() or not (sdk/'Library/x86_64/libkmod.a').is_file():
+   sys.exit(f'MacKernelSDK not found at {sdk}: pass --sdk, set MACKERNELSDK, or clone it to {REPO/"external/MacKernelSDK"}')
+@@ -94,7 +105,7 @@ def main():
+   run(['xcrun','strip','-S',exe])
+   info=dict(CFBundleIdentifier=ident,CFBundleExecutable=name,CFBundleName=name,CFBundlePackageType='KEXT',CFBundleVersion=VER,
+    CFBundleShortVersionString=VER,OSBundleCompatibleVersion='0.1.0',OSBundleLibraries=libs,
+-   IOKitPersonalities={name:dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch='0xe20b8086 0xe20c8086',**personality),
++   IOKitPersonalities={name:dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch=MATCH,**personality),
+     **{k:dict(CFBundleIdentifier=ident,**v) for k,v in more.items()}},**extra)
+   (bundle/'Info.plist').write_bytes(plistlib.dumps(info))
+   syms=subprocess.check_output(['xcrun','nm','-u',str(exe)],text=True)
+diff --git a/kernel/IntelXe/tests/platform_test.cpp b/kernel/IntelXe/tests/platform_test.cpp
+index e915aaa..5de3777 100644
+--- a/kernel/IntelXe/tests/platform_test.cpp
++++ b/kernel/IntelXe/tests/platform_test.cpp
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ // platform_test: offline check of the platform descriptor table (xe_platform.cpp), no GPU needed.
+ //   1. every id of xe_probe_ids.inc finds exactly one entry, the one that lists it; unknown ids find none
+-//   2. only the BMG-G21 entry is supported (and IntelXe's IOPCIMatch ids, e20b/e20c, are in it); every other entry
++//   2. only the BMG-G21 and (claw-lnl) LNL entries are supported (and IntelXe's IOPCIMatch ids, e20b/e20c, are in it); every other entry
+ //      carries the reason it is refused
+ //   3. the BMG-G21 values equal the constants the code used before the descriptor (2026-11-10, b17eac9)
+ //   4. XeProbe's former family table (copied below as it was) gives the same family and values per id and per name
+@@ -85,7 +85,9 @@ int main() {
+ 	for (uint32_t p = 0; p < kXePlatformCount; p++) {
+ 		const XePlatformDesc &d = kXePlatforms[p];
+ 		const bool g21 = d.platform == XE_BATTLEMAGE && same(d.subplatform, "G21");
+-		CHECK(d.supported == g21, "%s %s: supported %d", d.name, d.subplatform ? d.subplatform : "", d.supported);
++		// claw-lnl: Lunar Lake is supported too (the integrated path)
++		const bool lnl = d.platform == XE_LUNARLAKE;
++		CHECK(d.supported == (g21 || lnl), "%s %s: supported %d", d.name, d.subplatform ? d.subplatform : "", d.supported);
+ 		CHECK(d.supported || (d.missing && *d.missing), "%s: refused without a reason", d.name);
+ 		CHECK(d.platform != XE_PLATFORM_UNINITIALIZED && d.vaBits == 48 && d.vmMaxLevel >= 3 && d.dmaMaskBits >= 39 &&
+ 			d.wopcmBytes && d.patEntries && d.mocsUcIndex && d.gucFw && d.gucStem && d.engineMask, "%s: incomplete", d.name);
+diff --git a/kernel/IntelXe/xe_core.cpp b/kernel/IntelXe/xe_core.cpp
+index f7c9e8d..162c0c8 100644
+--- a/kernel/IntelXe/xe_core.cpp
++++ b/kernel/IntelXe/xe_core.cpp
+@@ -168,7 +168,10 @@ static bool gHiOn;                  // gHi only once the copy engine can clear i
+ // pages, 32 GB of 2 MB ones); the display's buffers (xeDispVramAlloc) may go down to kDispFloor. A user BO that does
+ // not fit goes beyond the window or to system memory instead (GEM_CREATE), as xe spills NEEDS_VISIBLE_VRAM BOs that
+ // allow system memory.
+-static constexpr uint64_t kWinReserve = 32ull << 20, kDispFloor = 8ull << 20;
++static constexpr uint64_t kWinReserveDgfx = 32ull << 20, kDispFloorDgfx = 8ull << 20;
++// claw-lnl: on an integrated GPU page tables are in system memory, so nothing of the DSM is kept back for them
++#define kWinReserve (xeIgpu() ? 0ull : kWinReserveDgfx)
++#define kDispFloor (xeIgpu() ? 0ull : kDispFloorDgfx)
+ static VBlock *visAlloc(uint64_t size, bool topdown, bool contiguous, uint64_t floor) {   // gResLock
+ 	if (gVis.freeBytes < floor || gVis.freeBytes - floor < ((size + kVChunk - 1) & ~(kVChunk - 1))) {
+ 		gStats.reserveHits++;
+@@ -1031,7 +1034,7 @@ void IntelXe::slpcSet(uint32_t id, uint32_t value) {
+ void IntelXe::slpcParams() {
+ 	const uint32_t cap = rd(0x138000), rp0 = mhzOf(cap & 0x1ff), rpn = mhzOf(cap >> 16 & 0x1ff),
+ 		rpe = mhzOf(rd(0x13800c) & 0x1ff);
+-	uint32_t max = gSlpcMax > 0 ? (uint32_t)gSlpcMax : rp0, min = gSlpcMin > 0 ? (uint32_t)gSlpcMin : 1200;
++	uint32_t max = gSlpcMax > 0 ? (uint32_t)gSlpcMax : rp0, min = gSlpcMin > 0 ? (uint32_t)gSlpcMin : xeBmg() ? 1200 : rpn;
+ 	if (max > rp0) max = rp0;
+ 	if (max < rpn) max = rpn;
+ 	if (min < rpn) min = rpn;
+@@ -1140,7 +1143,35 @@ int IntelXe::powerReport() {
+ // L3 nodes (MIRROR_FUSE3 31:16) for the software view, rounded down to 4 KB; it must leave room for the CCS (tile/512)
+ // below GSM. DSM (stolen, DSMBASE) and GSM lie above it; the minimum of all three is taken, and an implausible value
+ // falls back to the 11 GB used before. Needs forcewake.
++// claw-lnl: on an integrated GPU (graphics >= 12.70) the device memory is the stolen DSM, at BAR2 offset 8 MB, sized by
++// GGC GMS less the WOPCM at its top (xe_ttm_stolen_mgr.c detect_lmembar_integrated), less what Wa_14019821291 (media
++// 13.00-20.00) reserves below the WOPCM when the BIOS applied it. The end returned is a DPA (= BAR2 offset).
++uint64_t IntelXe::dsmEndIntegrated() {
++	const uint32_t ggc = rd(0x108040);   // GGC
++	if (((ggc >> 6) & 3) != 3) { say("DSM: GGC 0x%08x GGMS is not 8 MB: no stolen memory\n", ggc); return 0; }
++	const uint32_t gms = (ggc >> 8) & 0xff;
++	uint64_t stolen = gms <= 4 ? (uint64_t)gms * (32ull << 20) : (gms >= 0xf0 && gms <= 0xfe) ? (uint64_t)(gms - 0xf0 + 1) * (4ull << 20) : 0;
++	const uint64_t sr = (uint64_t)rd(STOLEN_RESERVED + 4) << 32 | rd(STOLEN_RESERVED);
++	uint64_t w = (sr >> 7) & 7, wopcm = 0;   // WOPCM_SIZE_MASK 9:7 (get_wopcm_size)
++	if (w == 5 || w == 6) w--;
++	if (w <= 3) wopcm = (1ull << w) << 20;
++	if (!stolen || !wopcm || wopcm >= stolen) { say("DSM: GMS 0x%x STOLEN_RESERVED 0x%llx: unusable\n", gms, sr); return 0; }
++	stolen -= wopcm;
++	const uint64_t io = bar2 ? bar2->getPhysicalAddress() + kIgpuDsmStart : 0;
++	if (gXePlat->mediaVerx100 >= 1300 && gXePlat->mediaVerx100 <= 2000 && io) {   // Wa_14019821291
++		const uint64_t psmi = ((uint64_t)rd(MEDIA_GT_GSI_OFFSET + 0x880c + 4) << 32 | rd(MEDIA_GT_GSI_OFFSET + 0x880c)) & ~0x3full;
++		if (psmi >= io && psmi < io + stolen) { say("DSM: %llu KB reserved for Wa_14019821291\n", (io + stolen - psmi) >> 10); stolen = psmi - io; }
++	}
++	uint64_t end = kIgpuDsmStart + stolen;
++	if (bar2 && end > bar2->getLength()) end = bar2->getLength();
++	end &= ~0xffffull;
++	say("DSM: GMS 0x%x, %llu MB stolen less %llu MB WOPCM -> device memory at BAR2 [8 MB, %llu MB)\n", gms,
++		(stolen + wopcm) >> 20, wopcm >> 20, end >> 20);
++	return end;
++}
++
+ uint64_t IntelXe::vramUsableEnd() {
++	if (!gXePlat->isDgfx) return dsmEndIntegrated();
+ 	const uint32_t range = rd(SG_TILE_ADDR_RANGE0);
+ 	const uint64_t tile = (uint64_t)(range >> 8 & 0x3ff) << 30, tileOff = (uint64_t)(range >> 1 & 0x7f) << 30;
+ 	const uint64_t gsm = ((uint64_t)rd(GSMBASE + 4) << 32 | rd(GSMBASE)) & ~0xfffffull;
+@@ -1229,8 +1260,16 @@ int IntelXe::bringUp() {
+ 	if (gUsm && gUmDpa && gUmDpa < vramEnd) vramEnd = gUmDpa;
+ 	vramVisible = bar2->getLength() < vramEnd ? bar2->getLength() & ~0xffffull : vramEnd;
+ 	say("BAR2 window %llu MB, VRAM for BOs %llu MB\n", vramVisible >> 20, vramEnd >> 20);
+-	wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
+-	wr(0xb194 + 3 * 8, 0xf);             //                 XEHPC_L3CLOS_MASK(3)
++	if (xeIgpu()) {
++		// claw-lnl: IntelXeFB bounds the DPAs it may touch through BAR2 by this (published before IntelXeReady)
++		pci->setProperty("IntelXeDsmEnd", vramEnd, 64);
++		if (vramEnd < vramUserStart + (8ull << 20))
++			say("DSM ends at %llu MB: no display buffers in device memory (frames are copied)\n", vramEnd >> 20);
++	}
++	if (gXePlat->graphicsVerx100 == 2001) {   // claw-lnl: Wa_16023588340 is graphics 20.01 only
++		wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
++		wr(0xb194 + 3 * 8, 0xf);             //                 XEHPC_L3CLOS_MASK(3)
++	}
+ 	gGeomDss = rd(XELP_GT_GEOMETRY_DSS_ENABLE);
+ 	gCompDss = rd(XEHP_GT_COMPUTE_DSS_ENABLE);
+ 	gEuMask = rd(XELP_EU_ENABLE);
+@@ -1240,7 +1279,9 @@ int IntelXe::bringUp() {
+ 		if (fuse3 >> 16 & 1u << b) gL3Mask |= (uint64_t)((fuse3 >> 4) & 0xf) << (b * 4);
+ 	// FF_MODE is not masked: keep the power-on value, set DIS_MESH_PARTIAL_AUTOSTRIP | DIS_MESH_AUTOSTRIP and
+ 	// VS_HIT_MAX_VALUE 25:20 = 0x3f (Wa_14021490052, lrc tuning)
+-	gFfMode = (rd(0x6210) & ~(0x3fu << 20)) | 1u << 16 | 1u << 15 | 0x3fu << 20;
++	// claw-lnl: VS_HIT_MAX_VALUE is a 20.01 tuning only; 14021490052 (the autostrip bits) is 20.01 and 20.04
++	gFfMode = rd(0x6210) | 1u << 16 | 1u << 15;
++	if (gXePlat->graphicsVerx100 == 2001) gFfMode = (gFfMode & ~(0x3fu << 20)) | 0x3fu << 20;
+ 	uint32_t c0 = rd(0xd00);             // RPM_CONFIG0 (xe_gt_clock_init)
+ 	static const uint32_t freq[] = {24000000, 19200000, 38400000, 25000000};
+ 	gRefClock = ((c0 >> 3) & 7) < 4 ? freq[(c0 >> 3) & 7] >> (3 - ((c0 >> 1) & 3)) : 0;
+@@ -1622,14 +1663,84 @@ struct PtNode {
+ 	bool scratch;               // its VM's (XeVm::scratch): what an empty entry is
+ };
+ 
+-struct PtSlab { uint64_t dpa; VBlock *blk; uint16_t mask; PtSlab *next; };   // 16 table pages in one 64 KB block
++// claw-lnl: on an integrated GPU the 64 KB slabs are physically contiguous system memory (xe_pt_create: page tables are
++// XE_BO_FLAG_VRAM_IF_DGFX, so system memory there, written through the CPU's cached mapping and walked coherently: the
++// PDEs carry XE_CACHE_WB, pde_pat_index). sys/cpu/dma are set only then; dpa is the slab's device address.
++struct PtSlab {
++	uint64_t dpa; VBlock *blk; uint16_t mask; PtSlab *next;
++	IOBufferMemoryDescriptor *sys; volatile uint64_t *cpu; DmaMap *dma; PtSlab *hnext;
++};   // 16 table pages in one 64 KB block
+ static PtSlab *gPtSlabs;
+ static uint32_t gPtPages;
++static PtSlab *gPtHash[1024];          // integrated: slab by device address, for ptCpu (gPtHashLock)
++static IOSimpleLock *gPtHashLock;
++static inline uint32_t ptHashOf(uint64_t base) { return (uint32_t)(((base >> 16) * 2654435761u) >> 22) & 1023; }
++
++// The CPU's view of a page-table page (or of the table entry at dpa): BAR2 on dGFX, the slab's own mapping on iGPU.
++static volatile uint64_t *ptCpu(uint64_t dpa) {
++	if (!xeIgpu()) return vram64(dpa);
++	const uint64_t base = dpa & ~(kVChunk - 1);
++	volatile uint64_t *p = nullptr;
++	IOSimpleLockLock(gPtHashLock);
++	for (PtSlab *sl = gPtHash[ptHashOf(base)]; sl; sl = sl->hnext)
++		if (sl->dpa == base) { p = sl->cpu + (dpa - base) / 8; break; }
++	IOSimpleLockUnlock(gPtHashLock);
++	return p;
++}
++
++static PtSlab *ptSysSlabNew() {   // integrated: a new slab of system memory, outside gResLock
++	auto *sl = static_cast<PtSlab *>(IOMallocZero(sizeof(PtSlab)));
++	if (!sl) return nullptr;
++	// 64 KB aligned (the physical mask's clear low bits set the alignment): ptCpu finds a slab by dpa & ~(64 KB - 1).
++	// Under VT-d the IOVA must come out aligned as well, or the slab is refused (OpenCore DisableIoMapper: physical).
++	sl->sys = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
++		kVChunk, xePlatformPhysMask(gXePlat) & ~(kVChunk - 1));
++	if (sl->sys) bzero(sl->sys->getBytesNoCopy(), kVChunk);
++	sl->dma = sl->sys ? static_cast<DmaMap *>(IOMallocZero(sizeof(DmaMap))) : nullptr;   // DmaMap: all members zero
++	uint64_t addr = 0, run = 0;
++	if (!sl->dma || !sl->dma->map(sl->sys) || !sl->dma->lookup(0, &addr, &run) || run < kVChunk || (addr & (kVChunk - 1))) {
++		if (sl->dma) { sl->dma->unmap(); IOFree(sl->dma, sizeof(DmaMap)); }
++		OSSafeReleaseNULL(sl->sys);
++		IOFree(sl, sizeof(*sl));
++		return nullptr;
++	}
++	sl->dpa = addr;
++	sl->cpu = static_cast<volatile uint64_t *>(sl->sys->getBytesNoCopy());
++	return sl;
++}
++
++static void ptSysSlabFree(PtSlab *sl) {
++	sl->dma->unmap();
++	IOFree(sl->dma, sizeof(DmaMap));
++	OSSafeReleaseNULL(sl->sys);
++	IOFree(sl, sizeof(*sl));
++}
+ 
+ static bool ptPageAlloc(uint64_t *dpa) {
+ 	IOLockLock(gResLock);
+ 	PtSlab *sl = gPtSlabs;
+ 	while (sl && sl->mask == 0xffff) sl = sl->next;
++	if (!sl && xeIgpu()) {
++		IOLockUnlock(gResLock);
++		if (!gPtHashLock) {
++			IOSimpleLock *l = IOSimpleLockAlloc();
++			if (!l || !OSCompareAndSwapPtr(nullptr, l, &gPtHashLock)) { if (l) IOSimpleLockFree(l); }
++		}
++		PtSlab *fresh = gPtHashLock ? ptSysSlabNew() : nullptr;
++		IOLockLock(gResLock);
++		if (!fresh) {
++			gStats.ptFails++;
++			IOLockUnlock(gResLock);
++			return false;
++		}
++		sl = fresh;
++		sl->next = gPtSlabs;
++		gPtSlabs = sl;
++		IOSimpleLockLock(gPtHashLock);
++		sl->hnext = gPtHash[ptHashOf(sl->dpa)];
++		gPtHash[ptHashOf(sl->dpa)] = sl;
++		IOSimpleLockUnlock(gPtHashLock);
++	}
+ 	if (!sl) {
+ 		VBlock *b = buddyAlloc(&gVis, kVChunk, false, true);   // the whole window: kWinReserve is kept for this
+ 		sl = b ? static_cast<PtSlab *>(IOMallocZero(sizeof(PtSlab))) : nullptr;
+@@ -1661,6 +1772,16 @@ static void ptPageFree(uint64_t dpa) {
+ 		if ((dpa & ~(kVChunk - 1)) != sl->dpa) continue;
+ 		sl->mask &= (uint16_t)~(1u << ((dpa - sl->dpa) / 0x1000));
+ 		gPtPages--;
++		if (!sl->mask && sl->sys) {   // integrated: the slab back to the system
++			*pp = sl->next;
++			IOSimpleLockLock(gPtHashLock);
++			for (PtSlab **hp = &gPtHash[ptHashOf(sl->dpa)]; *hp; hp = &(*hp)->hnext)
++				if (*hp == sl) { *hp = sl->hnext; break; }
++			IOSimpleLockUnlock(gPtHashLock);
++			IOLockUnlock(gResLock);
++			ptSysSlabFree(sl);
++			return;
++		}
+ 		if (!sl->mask) {   // the whole 64 KB block back to the buddy
+ 			*pp = sl->next;
+ 			buddyFree(&gVis, sl->blk);
+@@ -1673,7 +1794,28 @@ static void ptPageFree(uint64_t dpa) {
+ 	IOLockUnlock(gResLock);
+ }
+ 
+-static uint64_t pdeOf(uint64_t dpa) { return dpa | 1 | 2 | 1ull << 3 | 1ull << 4; }   // PAT 3: VRAM page tables
++// PAT 3 (XE_CACHE_NONE) for page tables in VRAM; claw-lnl: PAT 2 (XE_CACHE_WB) for cached system-memory ones (pde_pat_index)
++static uint64_t pdeOf(uint64_t dpa) { return dpa | 1 | 2 | (xeIgpu() ? 1ull << 4 : 1ull << 3 | 1ull << 4); }
++
++// claw-lnl: no flat-CCS metadata management on the integrated path (xe clears the CCS of new system-memory BOs on Xe2
++// iGPU, xe_bo_needs_ccs_pages; this driver does not), so a compressed PAT index is written as its uncompressed twin
++// (the same xe2_pat_table entry with comp_en clear). Xe2's flat CCS is transparent to the surface layout, so data
++// written and read through the twin is the same data, just never compressed. Uncompressed indexes pass unchanged.
++static uint16_t patEffective(uint16_t pat) {
++	if (!xeIgpu()) return pat;
++	switch (pat) {
++	case 9: return 0;    // ( 0,1,0,0,3,0) -> ( 0,0,0,0,3,0)
++	case 10: return 8;   // ( 0,1,0,3,0,0) -> ( 0,0,0,3,0,0)
++	case 11: return 6;   // ( 1,1,0,1,3,0) -> ( 1,0,0,1,3,0)
++	case 12: return 3;   // ( 0,1,0,3,3,0) -> ( 0,0,0,3,3,0)
++	case 14: return 13;  // ( 0,1,0,0,0,0) -> ( 0,0,0,0,0,0)
++	case 15: return 6;   // ( 1,1,0,1,1,0) -> ( 1,0,0,1,3,0): no WT twin; non-coherent, no-promote kept
++	case 21: return 20;  // CLOS1
++	case 25: return 24;  // CLOS2
++	case 29: return 28;  // CLOS3
++	default: return pat;
++	}
++}
+ 
+ // pte_encode_pat_index: PAT0 bit 3, PAT1 bit 4, PAT2 bit 7 on a 4 KB PTE / bit 12 on a huge leaf, PAT3 62, PAT4 61
+ static uint64_t patBits(uint16_t pat, int level = 0) {
+@@ -1709,7 +1851,7 @@ static int scratchInit() {
+ 		uint64_t &t = lvl == 2 ? gScratchL2 : gScratchL3;
+ 		if (!ptPageAlloc(&t)) return ENOMEM;
+ 		const uint64_t v = emptyEntry(lvl, true);
+-		volatile uint64_t *p = vram64(t);
++		volatile uint64_t *p = ptCpu(t);
+ 		for (int i = 0; i < 512; i++) p[i] = v;
+ 	}
+ 	return 0;
+@@ -1735,7 +1877,7 @@ static void ptSet(PtNode *n, uint32_t idx, uint64_t v) {
+ 	if (old == empty && v != empty) n->used++;
+ 	else if (old != empty && v == empty) n->used--;
+ 	n->e[idx] = v;
+-	vram64(n->dpa)[idx] = v;
++	ptCpu(n->dpa)[idx] = v;
+ }
+ 
+ // A table at `level` whose entries stand for parent entry `from` (a huge leaf to split, or empty).
+@@ -1757,7 +1899,7 @@ static PtNode *ptNodeNew(int level, uint64_t from, bool scratch) {
+ 	}
+ 	const bool split = level < 4 && isLeaf(from, level + 1) && from != emptyEntry(level + 1, scratch);
+ 	const uint64_t empty = emptyEntry(level, scratch);
+-	volatile uint64_t *gpu = vram64(n->dpa);
++	volatile uint64_t *gpu = ptCpu(n->dpa);
+ 	for (uint32_t i = 0; i < 512; i++) {
+ 		n->e[i] = split ? leafChild(from, level + 1, i) : empty;
+ 		if (n->e[i] != empty) n->used++;
+@@ -1833,7 +1975,7 @@ struct MapReq {
+ 		return true;
+ 	}
+ 	uint64_t leaf(uint64_t pa, int level) const {
+-		uint64_t v = pa | 1 | patBits(pat, level) | 1ull << 10;   // AE (XE_USM_PPGTT_PTE_AE: device atomics)
++		uint64_t v = pa | 1 | patBits(patEffective(pat), level) | 1ull << 10;   // AE (XE_USM_PPGTT_PTE_AE: device atomics)
+ 		if (!(flags & DRM_XE_VM_BIND_FLAG_READONLY)) v |= 2;
+ 		if (bo->vram) v |= 1ull << 11;   // DM
+ 		if (level) v |= 1ull << 7;       // PS
+@@ -3761,7 +3903,7 @@ static constexpr uint16_t kPatCompUC = 12;
+ // The address a copy reads VRAM at: decompressing for a BO that may hold compressed data. Linux uses the compressed
+ // identity for user BOs (ttm_bo_type_device) only; here, for BOs ever bound with a compressed PAT, so kernel and
+ // display memory (whose CCS state a CPU write may have left stale) are copied as they are.
+-static uint64_t identRead(bool comp, uint64_t dpa) { return (comp ? kIdentCompVa : kIdentVa) + dpa; }
++static uint64_t identRead(bool comp, uint64_t dpa) { return (comp && !xeIgpu() ? kIdentCompVa : kIdentVa) + dpa; }
+ static constexpr uint16_t kPatUC = 3;              // Xe2 PAT 3: uncached
+ 
+ static IOLock *gMoveLock;   // the migrate VM's kMoveVa window (boMoveSys)
+@@ -3770,7 +3912,8 @@ static int migrateInit() {
+ 	if (gMigVm) return 0;
+ 	XeVm *vm = vmCreate(0xffff1);
+ 	if (!vm) return ENOMEM;
+-	const uint64_t tile = (uint64_t)(gDev->mmio(SG_TILE_ADDR_RANGE0) >> 8 & 0x3ff) << 30;
++	// claw-lnl: on an iGPU the device memory is the DSM at BAR2 offsets below vramEnd: one 1 GB identity covers it
++	const uint64_t tile = xeIgpu() ? (vramEnd ? 1ull << 30 : 0) : (uint64_t)(gDev->mmio(SG_TILE_ADDR_RANGE0) >> 8 & 0x3ff) << 30;
+ 	// a BO standing for all of VRAM: one 1 GB-aligned physical run, so ptRange writes 1 GB leaves (XE_PDPE_PS_1G)
+ 	VBlock all = {};
+ 	all.order = kVMaxOrder;
+@@ -3784,7 +3927,7 @@ static int migrateInit() {
+ 		all.off = gb << 30;
+ 		err = vmMap(vm, &id, 0, 1ull << 30, kIdentVa + (gb << 30), kPatUC, 0, &ctx, true);
+ 	}
+-	for (uint64_t gb = 0; !err && gb < (tile >> 30); gb++) {
++	for (uint64_t gb = 0; !err && gb < (tile >> 30) && !xeIgpu(); gb++) {   // claw-lnl: no flat CCS management on iGPU
+ 		all.off = gb << 30;
+ 		err = vmMap(vm, &id, 0, 1ull << 30, kIdentCompVa + (gb << 30), kPatCompUC, 0, &ctx, true);
+ 	}
+@@ -4754,7 +4897,7 @@ static int deviceQuery(drm_xe_device_query *q) {
+ 			// xe_query.c query_mem_regions: system memory used = GPU BOs in system memory (TTM TT usage); VRAM total =
+ 			// the usable size, used including the kernel's own reservation below vramUserStart.
+ 			struct { drm_xe_query_mem_regions h; drm_xe_mem_region m[2]; } r = {};
+-			r.h.num_mem_regions = 2;
++			r.h.num_mem_regions = xeIgpu() ? 1 : 2;   // claw-lnl: no VRAM region on an iGPU (xe_query.c: per mem_region_mask)
+ 			r.m[0] = {};
+ 			r.m[0].mem_class = DRM_XE_MEM_REGION_CLASS_SYSMEM;
+ 			r.m[0].instance = 0;
+@@ -4770,6 +4913,7 @@ static int deviceQuery(drm_xe_device_query *q) {
+ 			r.m[1].cpu_visible_used = gVisibleUsed + vramUserStart;
+ 			IOLockUnlock(gResLock);
+ 			r.m[1].cpu_visible_size = vramVisible;
++			if (xeIgpu()) return answer(q, &r, sizeof(r.h) + sizeof(r.m[0]));
+ 			return answer(q, &r, sizeof(r));
+ 		}
+ 		case DRM_XE_DEVICE_QUERY_CONFIG: {
+@@ -5200,7 +5344,7 @@ static int vmBindRange(XeVm *vm, XeBo *bo, uint64_t off, uint64_t addr, uint64_t
+ // compression. WAS: MAP only, 16-19 and 32+ refused, so 28-31 reached the PTEs, entries this driver (as xe) never
+ // programs (IntelXe::programPatMocs writes 28). Mesa uses 0, 1, 6, 9 and 11 (intel_device_info XE2_PAT_ENTRIES; host
+ // pointers: 1, cached-coherent), the same index for an unbind as for its bind.
+-static constexpr uint32_t kPatComp = 0x0220de00u;                 // XE2_COMP_EN: 9-12, 14, 15, 21, 25
++static constexpr uint32_t kPatComp = 0x2220de00u;                 // XE2_COMP_EN: 9-12, 14, 15, 21, 25, 29 (32 entries)
+ static constexpr uint32_t kPatReserved = 0x000f0000u;             // 16-19: coh_mode 0
+ static constexpr uint32_t kPatCoherent = 0x0cc000b6u;             // coh_mode 1-way or 2-way: 1, 2, 4, 5, 7, 22, 23, 26, 27
+ // n_entries: gXePlat->patEntries. The three masks are xe2_pat_table's (graphics 20).
+@@ -5960,7 +6104,7 @@ static int pmCopyAll(bool toSys) {
+ }
+ 
+ static void ptRewrite(const PtNode *n) {
+-	volatile uint64_t *gpu = vram64(n->dpa);
++	volatile uint64_t *gpu = ptCpu(n->dpa);
+ 	for (uint32_t i = 0; i < 512; i++) gpu[i] = n->e[i];
+ 	if (n->child)
+ 		for (uint32_t i = 0; i < 512; i++)
+@@ -6133,7 +6277,7 @@ int xeResume() {
+ 	lrcResumeRestore();   // before any queue is registered again (and before the migrate queue copies VRAM back)
+ 	// page tables from their shadows: the scratch tables, the migrate VM, every client VM
+ 	for (int lvl = 2; lvl <= 3; lvl++) {
+-		volatile uint64_t *p = vram64(lvl == 2 ? gScratchL2 : gScratchL3);
++		volatile uint64_t *p = ptCpu(lvl == 2 ? gScratchL2 : gScratchL3);
+ 		for (int i = 0; i < 512; i++) p[i] = emptyEntry(lvl, true);
+ 	}
+ 	if (gMigVm) ptRewrite(gMigVm->top);
+@@ -6188,7 +6332,8 @@ int xeResume() {
+ 	// pixelated whatever image it was given. At a cold boot the GOP initializes them; on resume nothing did. A copy-
+ 	// engine clear (PVC_MEM_SET, an uncompressed write, as xe_migrate_clear on Xe2 dGFX, which emits no CCS clear)
+ 	// makes data and CCS state defined before IntelXeFB is told (event 2) and redraws them.
+-	{
++	// claw-lnl: not on an iGPU, where DPA [0, 8 MB) is the GSM itself (the GGTT) and the DSM is system RAM kept in sleep
++	if (!xeIgpu()) {
+ 		static_assert((kVChunk << 9) == vramUserStart, "the low range is one 32 MB buddy block");
+ 		VBlock low = {};
+ 		low.order = 9;
+@@ -7883,7 +8028,8 @@ static int xeIoctlLocked(XeClientState *c, uint32_t request, uint8_t *buf) {
+ 			// zero or unknown cpu_caching, WB for a BO that may live in VRAM or is a scan-out, NEEDS_VISIBLE_VRAM without
+ 			// VRAM and an unknown vm_id were all accepted. Mesa ANV and iris never send those (anv xe_gem_create: VRAM
+ 			// placements always WC, WB only for NO_LOCAL_MEM system BOs; xemac's fake device has made the same checks).
+-			constexpr uint32_t kMemRegionMask = 3;   // xe->info.mem_region_mask: system (bit 0) and tile 0's VRAM (bit 1)
++			// xe->info.mem_region_mask: system (bit 0) and tile 0's VRAM (bit 1); claw-lnl: system only on an iGPU
++			const uint32_t kMemRegionMask = xeIgpu() ? 1u : 3u;
+ 			constexpr uint32_t kFlags = DRM_XE_GEM_CREATE_FLAG_DEFER_BACKING | DRM_XE_GEM_CREATE_FLAG_SCANOUT |
+ 				DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM | DRM_XE_GEM_CREATE_FLAG_NO_COMPRESSION;
+ 			if (g->pad[0] || g->pad[1] || g->pad[2] || g->reserved[0] || g->reserved[1]) return EINVAL;
+diff --git a/kernel/IntelXe/xe_platform.cpp b/kernel/IntelXe/xe_platform.cpp
+index 9f73d36..1e606e2 100644
+--- a/kernel/IntelXe/xe_platform.cpp
++++ b/kernel/IntelXe/xe_platform.cpp
+@@ -160,8 +160,11 @@ constexpr XePlatformDesc lnl() {   // lnl_desc
+ 	d.hucFw = "xe/lnl_huc.bin";
+ 	d.gscFw = "xe/lnl_gsc_104.bin";
+ 	d.dmcFw = "i915/xe2lpd_dmc.bin";   // display 20.00
+-	d.missing = "Xe2_LPG integrated (20.04): integrated memory path (no VRAM/BAR2, system-memory flat CCS), 32 PAT "
+-		"entries, Xe2_LPG/Xe2_LPM workarounds, media 20.00 tables, GSC for HuC, xe/lnl firmware";
++	// claw-lnl: the integrated path (stolen DSM as the kernel's device memory, BOs in system memory, page tables in
++	// system memory, compressed PATs mapped to their uncompressed twins), the 32-entry Xe2 PAT without PTA, the
++	// Xe2_LPG workarounds and GuC WA KLVs of 20.04. The media GT (media 20.00, HuC through the GSC) stays off by default
++	// (boot-arg -intelxe_video). Untested on hardware: a build with the xe/lnl GuC starts on it.
++	d.supported = true;
+ 	return mediaXelpmp(graphicsXe2(d));
+ }
+ constexpr XePlatformDesc bmg(bool g21) {   // bmg_desc
+diff --git a/kernel/IntelXeFB/IntelXeFB.cpp b/kernel/IntelXeFB/IntelXeFB.cpp
+index 07b89e1..29bf80d 100644
+--- a/kernel/IntelXeFB/IntelXeFB.cpp
++++ b/kernel/IntelXeFB/IntelXeFB.cpp
+@@ -508,6 +508,7 @@ class IntelXeFramebuffer : public IOFramebuffer {
+ 	IODisplayModeID fMode = 1;
+ 	bool fScaling = true;             // -intelxefb_noscale offers the native size only
+ 	bool fRates = true;               // -intelxefb_norates offers the firmware's refresh only
++	bool fIntegrated = false;         // claw-lnl: IntelXe.kext runs the integrated path (IntelXeIntegrated / IntelXeDsmEnd)
+ 	bool fCommonRates = true;         // -intelxefb_edidonly: no VRR common rates (60/75/100/120) beyond the EDID's
+ 	static constexpr IODisplayModeID kDriverModeIdLimit = 0x1000;   // driver ids are below; CoreDisplay's 0x80000000 up
+ 	intelxeedid::DriverMode fModes[intelxeedid::kMaxDriverModes];
+@@ -3495,7 +3496,7 @@ bool IntelXeFramebuffer::adoptFirmwareMode(IOPhysicalAddress barBase, IOPhysical
+ 		      fRefresh16 >> 16, ((fRefresh16 & 0xFFFF) * 100) >> 16);
+ 		return true;
+ 	}
+-	FBLOG("no pipe is scanning out (no monitor on the B580 at boot?)");
++	FBLOG("no pipe is scanning out (no monitor on the GPU at boot?)");
+ 	return false;
+ }
+ 
+@@ -3517,7 +3518,23 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 	IODeviceMemory *ap = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+ 	if (!fMMIO || !ap || fMMIO->getLength() < kGsm + 0x800000) { FBLOG("BAR0 or BAR2 is not available"); OSSafeReleaseNULL(fMMIO); return false; }
+ 	fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
+-	if (!adoptFirmwareMode(ap->getPhysicalAddress(), ap->getLength())) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
++	// claw-lnl: on an integrated GPU BAR2 (LMEMBAR) holds GSM at 0 and the stolen DSM from 8 MB; only [0, DSM end) is
++	// memory. IntelXe.kext publishes that end (IntelXeDsmEnd) before IntelXeReady, so every BAR2 bound below is it.
++	IOPhysicalLength barLen = ap->getLength();
++	if (OSNumber *de = OSDynamicCast(OSNumber, fPCI->getProperty("IntelXeDsmEnd"))) {
++		if (de->unsigned64BitValue() && de->unsigned64BitValue() < barLen) barLen = (IOPhysicalLength)de->unsigned64BitValue();
++		fIntegrated = true;
++	}
++	if (fPCI->getProperty("IntelXeIntegrated")) fIntegrated = true;
++	if (fIntegrated) {
++		// The built-in panel (eDP): no other refresh rates (a rate change retrains a DP link here) and no VRR, whose code
++		// programs display 14.01 (BMG); boot-arg -intelxefb_igpu_rates / -intelxefb_igpu_vrr to try them.
++		if (!intelxeBootArg("IntelXeFB", "-intelxefb_igpu_rates", dummy, sizeof(dummy))) fRates = false;
++		if (!intelxeBootArg("IntelXeFB", "-intelxefb_igpu_vrr", dummy, sizeof(dummy))) fVrrAllowed = false;
++		FBLOG("integrated GPU: device memory ends at BAR2 +%llu MB; rates %s, VRR %s", (unsigned long long)(barLen >> 20),
++		      fRates ? "on" : "off", fVrrAllowed ? "on" : "off");
++	}
++	if (!adoptFirmwareMode(ap->getPhysicalAddress(), barLen)) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+ 	guardBegin();   // before anything that could take the machine down; published before the framebuffer is
+ 	probeEdid();
+ 	parseEdid();
+diff --git a/nullmoth/kexts/NVRM/accel/Info-NMX-IntelXe.plist b/nullmoth/kexts/NVRM/accel/Info-NMX-IntelXe.plist
+index 747d910..c145c86 100644
+--- a/nullmoth/kexts/NVRM/accel/Info-NMX-IntelXe.plist
++++ b/nullmoth/kexts/NVRM/accel/Info-NMX-IntelXe.plist
+@@ -29,7 +29,7 @@
+ 			<key>IOMatchCategory</key>
+ 			<string>IOAccelerator</string>
+ 			<key>IOPCIPrimaryMatch</key>
+-			<string>0xe20b8086 0xe20c8086</string>
++			<string>0xe20b8086 0xe20c8086 0x64a08086 0x64208086 0x64b08086</string>
+ 			<key>IOProbeScore</key>
+ 			<integer>100</integer>
+ 			<key>IOPropertyMatch</key>
+diff --git a/nullmoth/plugin/NVMTLDevice.m b/nullmoth/plugin/NVMTLDevice.m
+index 45215bd..30f4567 100644
+--- a/nullmoth/plugin/NVMTLDevice.m
++++ b/nullmoth/plugin/NVMTLDevice.m
+@@ -914,6 +914,22 @@ __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
+     if (cur && *cur) snprintf(v, sizeof v, "%s:%s", cur, rule); else snprintf(v, sizeof v, "%s", rule);
+     setenv(key, v, 1);
+ }
++/* claw-lnl: on an integrated Intel GPU (Lunar Lake) IntelXe.kext manages no flat-CCS metadata and writes compressed PAT
++   indexes as their uncompressed twins, so Mesa must not compress or fast-clear through CCS: INTEL_DEBUG gets "noccs"
++   (DEBUG_NO_CCS) before ANV parses it at its first instance. debug.intelxe.integrated is 1 only there;
++   NVMTL_IGPU_CCS=1 leaves INTEL_DEBUG alone. */
++__attribute__((constructor)) static void nvmtl_intelxe_igpu_noccs(void)
++{
++    int igpu = 0; size_t n = sizeof igpu;
++    if (sysctlbyname("debug.intelxe.integrated", &igpu, &n, NULL, 0) != 0 || !igpu) return;
++    const char *opt = getenv("NVMTL_IGPU_CCS");
++    if (opt && !strcmp(opt, "1")) return;
++    const char *cur = getenv("INTEL_DEBUG");
++    if (cur && strstr(cur, "noccs")) return;
++    char v[512];
++    if (cur && *cur) snprintf(v, sizeof v, "%s,noccs", cur); else snprintf(v, sizeof v, "noccs");
++    setenv("INTEL_DEBUG", v, 1);
++}
+ static bool nvmtl_process_is_allowed(void)
+ {
+     const char *me = getprogname();
+@@ -2707,7 +2723,8 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
+     nvlog("recommendedMaxWorkingSetSize -> %llu MB", (unsigned long long)(ws >> 20));
+     return ws;
+ }
+-- (BOOL)hasUnifiedMemory { return NO; }
++// claw-lnl: an integrated Intel GPU (debug.intelxe.integrated) shares system memory with the CPU
++- (BOOL)hasUnifiedMemory { int i = 0; size_t n = sizeof i; return sysctlbyname("debug.intelxe.integrated", &i, &n, NULL, 0) == 0 && i; }
+ - (uint64_t)dedicatedMemorySize { return nvmtl_vk_vram_bytes(); }
+ 
+ // Metal's own answer when it has one (an "AAPL,slot-name" above the accelerator, or a GPU the kext calls removable);
+diff --git a/release/templates/install.sh b/release/templates/install.sh
+index aa608c8..c28ad98 100755
+--- a/release/templates/install.sh
++++ b/release/templates/install.sh
+@@ -28,7 +28,7 @@ KEXTS=(IntelXeFB NMXAccel NMXAGDC)
+ OLD_KEXTS=(B580FB)   # the same kexts under their earlier names: removed by --apply, restored by --undo
+ # the cards this package supports: "PCI device id (vendor 8086), name[, untested]"; the same list as data/platforms.json
+ # "supported" (tools/parity/devices.py checks every copy in the repository)
+-CARDS=("e20b B580" "e20c B570 untested")
++CARDS=("e20b B580" "e20c B570 untested" "64a0 Arc-140V untested" "6420 Arc-LNL untested" "64b0 Arc-LNL untested")   # claw-lnl: Lunar Lake
+ GB=/Library/GPUBundles
+ SSV=/System/Library/Extensions/NVMTLDriver.bundle   # system-volume/ssv-install.sh's copy
+ USELIB=$GB/NVMTLDriver.use-library                  # NMXAccel: use the /Library copy even when $SSV exists
+-- 
+2.43.0
+

@@ -3,3 +3,5 @@ MacKernelSDK/
 firmware/
 *.o
 __pycache__/
+intelxe-lnl/work/
+intelxe-lnl/out/
